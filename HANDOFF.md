@@ -32,8 +32,7 @@ Read `README.md` first. It has the layout, the API and the install steps.
 1. Codex: `~/.codex/config.toml` sets `gpt-6.1-sol`, which the ChatGPT login rejects. Pick a supported model.
 2. Failover on truncated output: retry on another key, or fail as today?
 3. Planner: skip workers that doctor reports down? (Yes is the proposal.)
-4. Retire the old `com.agent-router` launchd job and `/Applications/Agent Router.app` so only Lingonberry owns port 8799. Both are outside this repo; nothing was changed there.
-5. Trash `~/Developer/agent-router` (the Python backbone). It is no longer used by Lingonberry.
+4. Done 2026-11-25: Python router retired. Archived to `~/Developer/_archive/agent-router-python-2026-11-25/` (repo, state, launchd plists, `backbone` shim). Left for a later decision: the Oracle VM hub and `~/.claude/scripts/mac-node-setup.sh` (remote Python node, not touched).
 
 ## Known gaps
 

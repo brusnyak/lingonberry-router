@@ -18,16 +18,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
-/// State lives in ~/.lingonberry. The pre-rename database stays where it is and is used only
-/// when the new location has nothing yet, so existing run history is never moved or lost.
+/// Run history and receipts: ~/.lingonberry/lingonberry.db.
 fn default_db_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    let new = Path::new(&home).join(".lingonberry").join("lingonberry.db");
-    let legacy = Path::new(&home).join(".agent-router").join("lingonberry.db");
-    if !new.exists() && legacy.exists() {
-        return legacy;
-    }
-    new
+    Path::new(&home).join(".lingonberry").join("lingonberry.db")
 }
 
 #[tokio::main]

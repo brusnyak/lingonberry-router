@@ -16,9 +16,9 @@ Nothing here is hosted. Everything runs on your Mac and talks to loopback only.
 | What | Where |
 |---|---|
 | Source | `core/src/*.rs`, `ui/Sources/LingonberryUI/main.swift` |
-| Run database | `~/.lingonberry/lingonberry.db` (SQLite). Falls back to `~/.agent-router/lingonberry.db` only if the new file does not exist yet |
+| Run database | `~/.lingonberry/lingonberry.db` (SQLite). Limits file `~/.lingonberry/limits.json` |
 | Git worktrees for isolated runs | `<project>/.lingonberry/worktrees/` |
-| Provider keys | `~/.env` or `~/.config/lingonberry/env`, as `NAME=value`. Legacy `~/.config/agent-router/env` is read last |
+| Provider keys | `~/.env` or `~/.config/lingonberry/env`, as `NAME=value` |
 | Installed app | `/Applications/Lingonberry.app` (binary `Contents/MacOS/lingonberry-ui`) |
 | Core binary | `core/target/{debug,release}/lingonberry-core`. The app starts the newest one it finds |
 | Plist template | `ui/Resources/Info.plist` (matches the installed bundle) |

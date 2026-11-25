@@ -378,13 +378,11 @@ mod tests {
     }
 }
 
-/// Env files that may hold provider keys, in priority order. The last entry is the legacy
-/// location from before the rename; it is read only as a fallback.
+/// Env files that may hold provider keys, in priority order.
 pub fn env_files(home: &str) -> Vec<String> {
     vec![
         format!("{}/.env", home),
         format!("{}/.config/lingonberry/env", home),
-        format!("{}/.config/agent-router/env", home),
     ]
 }
 

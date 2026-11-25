@@ -2,7 +2,6 @@ target/
 .build/
 .DS_Store
 .lingonberry/
-.agent-router/
 *.db
 *.db-wal
 *.db-shm
