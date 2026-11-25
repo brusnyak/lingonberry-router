@@ -1,3 +1,5 @@
+> **Superseded.** Python-era spec for the old Agent Router menu bar (RouterBar). Kept for history only. The current app and core are documented in `README.md` and `HANDOFF.md`.
+
 # RouterBar v2 — menu-bar app spec
 
 Status: draft for owner approval, 2026-11-24. Supersedes nothing; `DESIGN.md` still owns tokens.

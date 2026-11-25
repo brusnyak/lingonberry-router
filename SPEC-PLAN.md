@@ -1,3 +1,5 @@
+> Historical plan from the Python-era rewrite. Product name is Lingonberry Router; see `README.md`. References to FlorianBruniaux/agent-router are a third-party project, not this one.
+
 # Lingonberry Router — Spec & Plan (DRAFT v1, 2026-11-24)
 
 Single source of truth for the rewrite: Rust core + native UI per platform. Replaces the Python `backbone` baseline without changing the product intent (VISION.md, AGENT_ROUTER.md, COMPONENTS.md, STACK.md remain valid; stack and implementation change).

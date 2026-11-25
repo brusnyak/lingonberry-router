@@ -207,10 +207,7 @@ fn scan_keys() -> BTreeMap<String, Vec<String>> {
     let home = env::var_os("HOME")
         .map(|h| h.to_string_lossy().to_string())
         .unwrap_or_default();
-    for envfile in [
-        format!("{}/.env", home),
-        format!("{}/.config/agent-router/env", home),
-    ] {
+    for envfile in env_files(&home) {
         if let Ok(text) = fs::read_to_string(&envfile) {
             for line in text.lines() {
                 let line = line.trim();
@@ -381,7 +378,17 @@ mod tests {
     }
 }
 
-/// Value of a key slot: process env first, then the two env files discovery already scans.
+/// Env files that may hold provider keys, in priority order. The last entry is the legacy
+/// location from before the rename; it is read only as a fallback.
+pub fn env_files(home: &str) -> Vec<String> {
+    vec![
+        format!("{}/.env", home),
+        format!("{}/.config/lingonberry/env", home),
+        format!("{}/.config/agent-router/env", home),
+    ]
+}
+
+/// Value of a key slot: process env first, then the env files discovery already scans.
 /// Discovery sees names from those files, so the value must come from them too.
 /// The return value is never printed.
 pub fn key_value(name: &str) -> Option<String> {
@@ -391,7 +398,7 @@ pub fn key_value(name: &str) -> Option<String> {
         }
     }
     let home = std::env::var("HOME").ok()?;
-    for file in [format!("{}/.env", home), format!("{}/.config/agent-router/env", home)] {
+    for file in env_files(&home) {
         let Ok(text) = std::fs::read_to_string(&file) else { continue };
         for line in text.lines() {
             let line = line.trim();

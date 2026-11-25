@@ -18,9 +18,16 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// State lives in ~/.lingonberry. The pre-rename database stays where it is and is used only
+/// when the new location has nothing yet, so existing run history is never moved or lost.
 fn default_db_path() -> PathBuf {
     let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".agent-router").join("lingonberry.db")
+    let new = Path::new(&home).join(".lingonberry").join("lingonberry.db");
+    let legacy = Path::new(&home).join(".agent-router").join("lingonberry.db");
+    if !new.exists() && legacy.exists() {
+        return legacy;
+    }
+    new
 }
 
 #[tokio::main]
@@ -578,7 +585,7 @@ async fn run_with_worktree(
     };
 
     // Create worktree directory.
-    let wt_parent = current_dir.join(".agent-router").join("worktrees");
+    let wt_parent = current_dir.join(".lingonberry").join("worktrees");
     std::fs::create_dir_all(&wt_parent).ok();
 
     let wt_path = wt_parent.join(format!("wt-{}", &run_id[..8]));
