@@ -4,8 +4,8 @@ Read `README.md` first. It has the layout, the API and the install steps.
 
 ## State (2026-11-25)
 
-- Branch `router-live-ui` holds the work. `main` has the first port. Local commits only; nothing is pushed.
-- Core: `cargo test` 9/9. Agent argv, provider-scoped key leasing, async `key_for`, caller walk, `/version`, `/shutdown`, env and DB paths under `~/.lingonberry`.
+- `main` on GitHub (`brusnyak/lingonberry-router`, private) holds the full work. `router-live-ui` is the same commit as `main`. CI: `.github/workflows/ci.yml` (core test and build, gitleaks).
+- Core: `cargo test` 13/13 (clean clone, 2026-11-25). Agent argv, provider-scoped key leasing, async `key_for`, caller walk, `/version`, `/shutdown`, env and DB paths under `~/.lingonberry`.
 - UI: menu bar popover shows running work only, the live flow, and collapsed runs that expand to the full conversation. Stop and restart act on the app and the router.
 - Installed: `/Applications/Lingonberry.app` runs the current build. Core pid and `exe_mtime` were checked against the file on disk.
 - OMP: `~/.omp/agent/extensions/router-status.ts` reads `/snapshot` (not the old Python backbone). Backup of the previous file is alongside it. This file is outside this repo.
