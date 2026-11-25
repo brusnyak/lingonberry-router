@@ -1,0 +1,13 @@
+[package]
+name = "lingonberry-linux-tray"
+version = "0.1.0"
+edition = "2021"
+description = "Native Linux GTK4 + StatusNotifierItem (ksni) tray UI for Lingonberry Router"
+
+[dependencies]
+gtk4 = "0.9"
+ksni = "0.2"
+reqwest = { version = "0.12", features = ["json", "blocking", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "sync", "time"] }

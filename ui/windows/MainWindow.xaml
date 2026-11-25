@@ -1,0 +1,92 @@
+<Window x:Class="LingonberryTray.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Lingonberry Router"
+        Width="660" Height="620"
+        WindowStyle="None"
+        AllowsTransparency="True"
+        Background="Transparent"
+        Topmost="True"
+        ShowInTaskbar="False">
+    <Border x:Name="RootBorder" CornerRadius="10" Background="#12141a" BorderBrush="#262a34" BorderThickness="1">
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- Header -->
+            <Border Grid.Row="0" Padding="14,10" BorderBrush="#222630" BorderThickness="0,0,0,1">
+                <DockPanel>
+                    <TextBlock Text="Lingonberry Router" Foreground="#e2e8f0" FontWeight="SemiBold" FontSize="13" VerticalAlignment="Center"/>
+                    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right" VerticalAlignment="Center">
+                        <Button x:Name="BtnTheme" Content="Night" Margin="0,0,8,0" Padding="8,3" Click="OnToggleTheme"/>
+                        <Button Content="Rescan" Padding="8,3" Click="OnRescan"/>
+                    </StackPanel>
+                </DockPanel>
+            </Border>
+
+            <!-- Telemetry strip -->
+            <Border Grid.Row="1" Padding="14,8" Background="#161820" BorderBrush="#222630" BorderThickness="0,0,0,1">
+                <TextBlock x:Name="TelemetryText" Text="Connecting to 127.0.0.1:8799..." Foreground="#94a3b8" FontFamily="Consolas" FontSize="11"/>
+            </Border>
+
+            <!-- Main scrollable oversight content -->
+            <ScrollViewer Grid.Row="2" VerticalScrollBarVisibility="Auto" Padding="14">
+                <StackPanel x:Name="ContentStack">
+                    <TextBlock Text="LIVE WORKER SLOTS" Foreground="#64748b" FontFamily="Consolas" FontSize="10" FontWeight="Bold" Margin="0,0,0,6"/>
+                    <ItemsControl x:Name="LiveWorkersList" Margin="0,0,0,12">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="#161820" BorderBrush="#262a34" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,0,0,6">
+                                    <DockPanel>
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Worker}" Foreground="#e2e8f0" FontSize="12" FontWeight="SemiBold"/>
+                                            <TextBlock Text="{Binding Key}" Foreground="#94a3b8" FontFamily="Consolas" FontSize="10"/>
+                                        </StackPanel>
+                                        <Button Content="Kill" Tag="{Binding Pid}" HorizontalAlignment="Right" Padding="8,2" Click="OnKillWorker"/>
+                                    </DockPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+
+                    <TextBlock Text="CRON JOBS &amp; WATCHDOG OVERSIGHT" Foreground="#64748b" FontFamily="Consolas" FontSize="10" FontWeight="Bold" Margin="0,0,0,6"/>
+                    <ItemsControl x:Name="CronJobsList">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <Border Background="#161820" BorderBrush="#262a34" BorderThickness="1" CornerRadius="6" Padding="8" Margin="0,0,0,6">
+                                    <DockPanel>
+                                        <StackPanel>
+                                            <TextBlock Text="{Binding Name}" Foreground="#e2e8f0" FontSize="12" FontWeight="SemiBold"/>
+                                            <TextBlock FontFamily="Consolas" FontSize="10" Foreground="#94a3b8">
+                                                <Run Text="{Binding Schedule}"/>
+                                                <Run Text=" · "/>
+                                                <Run Text="{Binding Health}"/>
+                                            </TextBlock>
+                                        </StackPanel>
+                                        <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                                            <Button Content="Pause/Resume" Tag="{Binding Name}" Margin="0,0,4,0" Padding="6,2" Click="OnToggleJob"/>
+                                            <Button Content="Run" Tag="{Binding Name}" Margin="0,0,4,0" Padding="6,2" Click="OnRunJob"/>
+                                            <Button Content="Heal" Tag="{Binding Name}" Padding="6,2" Click="OnHealJob"/>
+                                        </StackPanel>
+                                    </DockPanel>
+                                </Border>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </StackPanel>
+            </ScrollViewer>
+
+            <!-- Footer -->
+            <Border Grid.Row="3" Padding="14,8" Background="#0e1015" BorderBrush="#222630" BorderThickness="0,1,0,0">
+                <DockPanel>
+                    <TextBlock Text="~/.lingonberry/router.json · loopback 127.0.0.1:8799" Foreground="#64748b" FontFamily="Consolas" FontSize="10" VerticalAlignment="Center"/>
+                    <Button Content="Close" HorizontalAlignment="Right" Padding="8,2" Click="OnClose"/>
+                </DockPanel>
+            </Border>
+        </Grid>
+    </Border>
+</Window>

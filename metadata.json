@@ -1,0 +1,5 @@
+{
+  "name": "Lingonberry Router",
+  "description": "Local AI agent router HTTP API for worker discovery, provider-scoped key leasing, routing receipts, and live snapshot monitoring.",
+  "requestFramePermissions": []
+}

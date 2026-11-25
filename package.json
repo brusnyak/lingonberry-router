@@ -1,0 +1,32 @@
+{
+  "name": "lingonberry-router",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local AI agent router HTTP API and worker registry (migrated from Rust core)",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "build": "vite build && tsc -p tsconfig.server.json",
+    "build:web": "vite build",
+    "start": "NODE_ENV=production node dist-server/server.js",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@tailwindcss/vite": "^4.3.5",
+    "@types/react": "^19.3.2",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "express": "^5.1.0",
+    "lucide-react": "^1.80.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "tailwindcss": "^4.3.5",
+    "vite": "^8.3.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.1",
+    "@types/node": "^22.14.0",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

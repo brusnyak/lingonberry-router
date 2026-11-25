@@ -1,63 +1,20 @@
-//! Shared data types for the Lingonberry Router core.
-
-use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use std::collections::BTreeMap;
 
-/// A discovered LLM provider endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
     pub id: String,
     pub base_url: String,
-    pub style: Option<String>, // "openai" | "anthropic" | etc.
+    pub style: Option<String>,
 }
 
-/// A discovered agent CLI on PATH.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: String,
-    pub path: Option<String>, // resolved binary path, if found
+    pub path: Option<String>,
 }
 
-/// A dispatchable worker: (agent, key_slot, provider, base_url, model).
-/// Derived at runtime from discovery + config; never hard-coded.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-pub struct Worker {
-    pub id: String,           // e.g. "pi:NIM_1", "groq:GROQ_API_KEY", "claude"
-    pub agent: String,        // e.g. "pi", "claude", "codex"
-    pub key_slot: Option<String>, // e.g. "NIM_1", "GROQ_API_KEY"; None for key-less CLIs
-    pub provider: String,     // e.g. "nim", "groq", "openrouter", "claude"
-    pub base_url: Option<String>,
-    pub model: Option<String>,
-    pub write_access: bool,
-}
-
-/// A single run of a task on a worker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Run {
-    pub id: String,
-    pub created_at: DateTime<Utc>,
-    pub worker: String,
-    /// Who asked the router: claude, codex, opencode, pi, or an IDE/user shell.
-    pub caller: Option<String>,
-    pub key_slot: Option<String>,
-    pub model: Option<String>,
-    pub provider: Option<String>,
-    pub prompt: String,
-    pub gate: Option<String>,
-    pub state: RunState,
-    pub pid: Option<u32>,
-    pub elapsed_ms: Option<u64>,
-    pub gate_passed: Option<bool>,
-    pub error: Option<String>,
-    /// Captured worker response, truncated. None while running.
-    pub output: Option<String>,
-    pub task_class: Option<String>,
-    pub receipt_id: Option<String>,
-}
-
-/// Run lifecycle states.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
     Queued,
@@ -70,7 +27,6 @@ pub enum RunState {
 }
 
 impl RunState {
-    /// One lowercase spelling for storage, HTTP and the UI. Never use Debug.
     pub fn as_str(&self) -> &'static str {
         match self {
             RunState::Queued => "queued",
@@ -83,13 +39,12 @@ impl RunState {
         }
     }
 
-    pub fn parse(s: &str) -> RunState {
-        match s.to_ascii_lowercase().as_str() {
+    pub fn from_str(s: &str) -> Self {
+        match s {
             "queued" => RunState::Queued,
             "leased" => RunState::Leased,
             "running" => RunState::Running,
             "done" => RunState::Done,
-            "failed" => RunState::Failed,
             "blocked" => RunState::Blocked,
             "escalated" => RunState::Escalated,
             _ => RunState::Failed,
@@ -97,17 +52,52 @@ impl RunState {
     }
 }
 
-/// The full router snapshot served over HTTP for the UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Snapshot {
+pub struct SessionStep {
     pub ts: f64,
-    pub overview: Overview,
-    pub workers: Vec<WorkerStatus>,
-    pub workers_live: Vec<LiveWorker>,
-    pub sessions: Vec<SessionRow>,
-    pub jobs: Vec<JobRow>,
-    pub router: RouterState,
-    pub system: SystemInfo,
+    pub stage: String,
+    pub title: String,
+    pub detail: String,
+    pub tone: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CookedPromptInfo {
+    pub raw_prompt: String,
+    pub cooked_prompt: String,
+    pub task_class: String,
+    pub selected_skill: String,
+    pub selected_command: String,
+    pub selected_hook: String,
+    pub retrieval_sources: Vec<String>,
+    pub gate_policy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Run {
+    pub id: String,
+    pub created_at: String,
+    pub worker: String,
+    pub caller: Option<String>,
+    pub key_slot: Option<String>,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub prompt: String,
+    pub gate: Option<String>,
+    pub state: RunState,
+    pub pid: Option<u32>,
+    pub elapsed_ms: Option<u64>,
+    pub gate_passed: Option<bool>,
+    pub error: Option<String>,
+    pub output: Option<String>,
+    pub task_class: Option<String>,
+    pub receipt_id: Option<String>,
+    pub cooked: Option<CookedPromptInfo>,
+    pub steps: Vec<SessionStep>,
+    pub fanout_group: Option<String>,
+    pub failover_from: Option<String>,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,10 +115,14 @@ pub struct Overview {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerStatus {
     pub name: String,
-    pub status: String, // active | idle | down | unchecked
+    pub status: String,
     pub calls_24h: usize,
     pub ok_24h: usize,
     pub key: Option<String>,
+    pub provider: Option<String>,
+    pub cooling_remaining_s: u64,
+    pub rpm_limit: usize,
+    pub inflight: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,13 +130,14 @@ pub struct LiveWorker {
     pub pid: u32,
     pub worker: String,
     pub caller: Option<String>,
-    pub key: Option<String>,   // actual leased key slot
+    pub key: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub run_id: Option<String>,
     pub task: String,
     pub started: f64,
     pub elapsed_s: f64,
+    pub fanout_group: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,17 +152,44 @@ pub struct SessionRow {
     pub duration_s: f64,
     pub reason: Option<String>,
     pub output: Option<String>,
+    pub receipt_id: Option<String>,
+    pub steps: Vec<SessionStep>,
+    pub fanout_group: Option<String>,
+    pub failover_from: Option<String>,
+    pub tokens_in: Option<u64>,
+    pub tokens_out: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRow {
     pub name: String,
     pub source: String,
-    pub every_s: Option<f64>,
+    pub schedule: String,
+    pub command: String,
+    pub every_s: Option<u64>,
     pub last: Option<f64>,
     pub rc: Option<i32>,
     pub paused: Option<bool>,
-    pub next_in_s: Option<i64>,
+    pub next_in_s: Option<u64>,
+    pub prompt: Option<String>,
+    pub health: String,
+    pub running_pid: Option<u32>,
+    pub crash_count: u32,
+    pub restart_count: u32,
+    pub auto_restart: bool,
+    pub last_error: Option<String>,
+    pub log_tail: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveCronProcess {
+    pub pid: u32,
+    pub job_name: String,
+    pub source: String,
+    pub command: String,
+    pub cpu_pct: f64,
+    pub mem_mb: f64,
+    pub elapsed_s: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -187,21 +209,28 @@ pub struct SystemInfo {
     pub disk_total_gb: Option<f64>,
 }
 
-/// A replayable receipt (constraint-first routing decision).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Receipt {
-    pub receipt_id: String,
-    pub context_hash: String,
-    pub catalog_hash: String,
-    pub policy_hash: String,
-    pub pool_hash: String,
-    pub registry_hash: String,
-    pub phase: String, // "plan" | "execute" | "verify"
-    pub selected: Option<ReceiptSelection>,
-    pub alternatives: Vec<ReceiptSelection>,
-    pub exclusions: Vec<ReceiptExclusion>,
-    pub abstention: Option<String>,
-    pub created_at: DateTime<Utc>,
+pub struct TelemetryPoint {
+    pub ts: f64,
+    pub cpu_pct: f64,
+    pub ram_pct: f64,
+    pub disk_pct: f64,
+    pub active_runs: usize,
+    pub rpm: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub ts: f64,
+    pub overview: Overview,
+    pub workers: Vec<WorkerStatus>,
+    pub workers_live: Vec<LiveWorker>,
+    pub sessions: Vec<SessionRow>,
+    pub jobs: Vec<JobRow>,
+    pub cron_live: Vec<LiveCronProcess>,
+    pub router: RouterState,
+    pub system: SystemInfo,
+    pub telemetry: Vec<TelemetryPoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,57 +249,61 @@ pub struct ReceiptExclusion {
     pub evidence: String,
 }
 
-/// Result of a worker execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerResult {
-    pub ok: bool,
-    pub output: String,
-    pub worker: String,
+pub struct Receipt {
+    pub receipt_id: String,
+    pub context_hash: String,
+    pub catalog_hash: String,
+    pub policy_hash: String,
+    pub pool_hash: String,
+    pub registry_hash: String,
+    pub phase: String,
+    pub selected: Option<ReceiptSelection>,
+    pub alternatives: Vec<ReceiptSelection>,
+    pub exclusions: Vec<ReceiptExclusion>,
+    pub abstention: Option<String>,
+    pub created_at: String,
+    pub caller: Option<String>,
+    pub cooked: Option<CookedPromptInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveredWorker {
+    pub id: String,
+    pub agent: String,
     pub key_slot: Option<String>,
-    pub pid: Option<u32>,   // spawned child process pid (CLI agents only)
-    pub latency_ms: u64,
-    pub gate_passed: bool,
+    pub provider: String,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
+    pub write_access: bool,
+    pub path: Option<String>,
 }
 
-impl Default for RunState {
-    fn default() -> Self {
-        RunState::Queued
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiscoveryData {
+    pub agents: Vec<Agent>,
+    pub keys: BTreeMap<String, Vec<String>>,
+    pub providers: BTreeMap<String, Provider>,
+    pub library_dirs: Vec<String>,
+    pub ssh_hosts: Vec<String>,
+    pub git_projects: Vec<String>,
+    pub browsers: Vec<String>,
 }
 
-impl Worker {
-    pub fn new(agent: &str, key_slot: Option<&str>, provider: &str) -> Self {
-        let id = match key_slot {
-            Some(k) => format!("{}:{}", agent, k),
-            None => agent.to_string(),
-        };
-        Self {
-            id,
-            agent: agent.to_string(),
-            key_slot: key_slot.map(|s| s.to_string()),
-            provider: provider.to_string(),
-            base_url: None,
-            model: None,
-            write_access: false,
-        }
-    }
-
-    pub fn label(&self) -> String {
-        match &self.key_slot {
-            Some(k) => format!("{}:{}", self.agent, k),
-            None => self.agent.clone(),
-        }
-    }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfConfigTarget {
+    pub target: String,
+    pub scope: String,
+    pub path: String,
+    pub status: String,
+    pub reason: String,
+    pub snippet: String,
 }
 
-pub fn now_ts() -> f64 {
-    Utc::now().timestamp() as f64
-}
-
-pub fn new_run_id() -> String {
-    Uuid::new_v4().to_string()[..8].to_string()
-}
-
-pub fn new_receipt_id() -> String {
-    Uuid::new_v4().to_string()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelfConfigPlan {
+    pub os: String,
+    pub preferred_root: String,
+    pub strategy: String,
+    pub targets: Vec<SelfConfigTarget>,
 }

@@ -1,54 +1,132 @@
-//! Dynamic worker registry + per-key leasing (KeyPool port).
-//! Workers are derived from discovery; keys are leased with cooldown/rpm/failover.
-
-use crate::discovery::{Discovery, DiscoveredWorker};
-use crate::types::{Run, RunState};
-use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use crate::config::Config;
+use crate::discovery::build_workers;
+use crate::types::{DiscoveredWorker, DiscoveryData, WorkerStatus};
+use anyhow::{bail, Result};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Max concurrent runs per key slot (owner config `max_concurrent_per_key`, was 3 in the Python router).
-pub const MAX_INFLIGHT: usize = 3;
-
-/// A leased key with state.
 #[derive(Debug, Clone)]
-struct KeyState {
+pub struct KeyState {
     pub name: String,
     pub provider: String,
     pub cooling_until: f64,
     pub inflight: usize,
     pub ok: usize,
     pub fail: usize,
-    pub window: Vec<f64>, // request timestamps, sliding 60s
+    pub window: Vec<f64>,
 }
 
-/// The registry holds all workers and key states.
-pub struct Registry {
+pub fn now_sec() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+pub struct RegistryInner {
     pub workers: Vec<DiscoveredWorker>,
-    keys: Mutex<BTreeMap<String, KeyState>>,
-    rpm_limit: usize,
-    cooldown_s: f64,
-    max_inflight: usize,
-    lease_wait_s: u64,
-    default_worker: String,
+    pub keys: BTreeMap<String, KeyState>,
+    pub down_workers: BTreeSet<String>,
+    pub rpm_limit: usize,
+    pub provider_rpm_caps: BTreeMap<String, usize>,
+    pub cooldown_s: u64,
+    pub max_inflight: usize,
+    pub default_worker: String,
+}
+
+/// Thread-safe worker & key-slot registry with RAII LeaseGuard.
+#[derive(Clone)]
+pub struct Registry {
+    inner: Arc<Mutex<RegistryInner>>,
+}
+
+/// RAII lease guard: automatically releases the leased inflight slot on Drop if not explicitly committed.
+pub struct LeaseGuard {
+    registry: Registry,
+    key_name: String,
+    released: bool,
+}
+
+impl LeaseGuard {
+    pub fn key_name(&self) -> &str {
+        &self.key_name
+    }
+
+    pub fn complete(mut self, ok: bool, cooldown_override_s: Option<u64>) {
+        self.registry
+            .release_key(&self.key_name, ok, cooldown_override_s);
+        self.released = true;
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        if !self.released {
+            // Panic or early cancel safety: never leak inflight capacity
+            self.registry.release_key(&self.key_name, false, Some(5));
+        }
+    }
 }
 
 impl Registry {
-    pub fn from_discovery(d: &Discovery) -> Self {
-        Self::from_discovery_with(d, &crate::config::Config::default())
-    }
-
-    /// Limits and exclusions come from the config (self-configured in ~/.lingonberry/config.json).
-    pub fn from_discovery_with(d: &Discovery, cfg: &crate::config::Config) -> Self {
-        let mut workers = d.workers();
-        workers.retain(|w| !cfg.excluded_agents.iter().any(|x| x == &w.agent));
-        // Deterministic order: sort by id.
+    pub fn new(discovery: &DiscoveryData, cfg: &Config) -> Self {
+        let excluded: BTreeSet<&str> = cfg.excluded_agents.iter().map(String::as_str).collect();
+        let mut workers: Vec<DiscoveredWorker> = build_workers(discovery)
+            .into_iter()
+            .filter(|w| !excluded.contains(w.agent.as_str()))
+            .collect();
         workers.sort_by(|a, b| a.id.cmp(&b.id));
 
         let mut keys = BTreeMap::new();
-        for (provider, names) in &d.keys {
+        for (provider, names) in &discovery.keys {
             for name in names {
-                keys.insert(name.clone(), KeyState {
+                keys.insert(
+                    name.clone(),
+                    KeyState {
+                        name: name.clone(),
+                        provider: provider.clone(),
+                        cooling_until: 0.0,
+                        inflight: 0,
+                        ok: 0,
+                        fail: 0,
+                        window: Vec::new(),
+                    },
+                );
+            }
+        }
+
+        Self {
+            inner: Arc::new(Mutex::new(RegistryInner {
+                workers,
+                keys,
+                down_workers: BTreeSet::new(),
+                rpm_limit: cfg.rpm_per_key,
+                provider_rpm_caps: BTreeMap::new(),
+                cooldown_s: cfg.cooldown_s,
+                max_inflight: cfg.max_inflight_per_key,
+                default_worker: cfg.default_worker.clone(),
+            })),
+        }
+    }
+
+    pub fn refresh(&self, discovery: &DiscoveryData, cfg: &Config) {
+        let mut guard = self.inner.lock().unwrap();
+        let excluded: BTreeSet<&str> = cfg.excluded_agents.iter().map(String::as_str).collect();
+        let mut workers: Vec<DiscoveredWorker> = build_workers(discovery)
+            .into_iter()
+            .filter(|w| !excluded.contains(w.agent.as_str()))
+            .collect();
+        workers.sort_by(|a, b| a.id.cmp(&b.id));
+        guard.workers = workers;
+        guard.rpm_limit = cfg.rpm_per_key;
+        guard.cooldown_s = cfg.cooldown_s;
+        guard.max_inflight = cfg.max_inflight_per_key;
+        guard.default_worker = cfg.default_worker.clone();
+
+        for (provider, names) in &discovery.keys {
+            for name in names {
+                guard.keys.entry(name.clone()).or_insert_with(|| KeyState {
                     name: name.clone(),
                     provider: provider.clone(),
                     cooling_until: 0.0,
@@ -59,271 +137,305 @@ impl Registry {
                 });
             }
         }
-
-        Self {
-            workers,
-            keys: Mutex::new(keys),
-            rpm_limit: cfg.rpm_per_key,
-            cooldown_s: cfg.cooldown_s,
-            max_inflight: cfg.max_inflight_per_key,
-            lease_wait_s: cfg.lease_wait_s,
-            default_worker: cfg.default_worker.clone(),
-        }
     }
 
-    /// List all workers (for the UI / allowed()).
+    pub fn set_rpm_limit(&self, target: &str, rpm: usize) -> bool {
+        let clamped = rpm.clamp(5, 300);
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(k) = guard.keys.get(target) {
+            let prov = k.provider.clone();
+            guard.provider_rpm_caps.insert(prov, clamped);
+            return true;
+        }
+        let has_provider = guard.keys.values().any(|k| k.provider == target);
+        if has_provider {
+            guard.provider_rpm_caps.insert(target.to_string(), clamped);
+            return true;
+        }
+        false
+    }
+
     pub fn list_workers(&self) -> Vec<DiscoveredWorker> {
-        self.workers.clone()
+        self.inner.lock().unwrap().workers.clone()
     }
 
-    /// Find a worker by id.
     pub fn find_worker(&self, id: &str) -> Option<DiscoveredWorker> {
-        self.workers.iter().find(|w| w.id == id).cloned()
+        self.inner
+            .lock()
+            .unwrap()
+            .workers
+            .iter()
+            .find(|w| w.id == id)
+            .cloned()
     }
 
-    /// Default worker: bare `pi` (pool-leased across NIM keys), then key-less CLIs, then anything.
+    pub fn mark_worker_down(&self, worker_id: &str, down: bool) {
+        let mut guard = self.inner.lock().unwrap();
+        if down {
+            guard.down_workers.insert(worker_id.to_string());
+        } else {
+            guard.down_workers.remove(worker_id);
+        }
+    }
+
+    pub fn is_worker_down(&self, worker_id: &str) -> bool {
+        self.inner.lock().unwrap().down_workers.contains(worker_id)
+    }
+
     pub fn select_best_worker(&self) -> Option<DiscoveredWorker> {
-        // The configured default wins when it is discovered and routable.
-        if let Some(w) = self.workers.iter().find(|w| w.id == self.default_worker && (w.key_slot.is_none() || w.agent == "pi")) {
-            return Some(w.clone());
-        }
-        if let Some(w) = self.workers.iter().find(|w| w.agent == "pi" && w.key_slot.is_none()) {
-            return Some(w.clone());
-        }
-        if let Some(w) = self.workers.iter().find(|w| w.key_slot.is_none()) {
-            return Some(w.clone());
-        }
-        self.workers.first().cloned()
-    }
-
-    /// Key for one dispatch of `w`. A pinned worker (`pi:NIM_2`) prefers its slot; the bare `pi`
-    /// worker takes whichever NIM key is free. Failover stays inside the worker's provider, so a
-    /// NIM request never leaves with a GROQ key. Waits up to 30 s for a free slot, then errors.
-    pub async fn key_for(&self, w: &DiscoveredWorker) -> Result<Option<String>, String> {
-        if w.key_slot.is_none() && w.agent != "pi" {
-            return Ok(None);
-        }
-        let prefer = w.key_slot.clone();
-        let mut last = String::new();
-        for _ in 0..self.lease_wait_s {
-            match self.lease_key_in(prefer.as_deref(), Some(&w.provider)) {
-                Ok(k) => return Ok(Some(k)),
-                Err(e) => last = e,
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        }
-        Err(last)
-    }
-
-    /// Lease a key for a worker run. Returns the key name or an error if none available.
-    pub fn lease_key(&self, prefer: Option<&str>) -> Result<String, String> {
-        self.lease_key_in(prefer, None)
-    }
-
-    fn lease_key_in(&self, prefer: Option<&str>, provider: Option<&str>) -> Result<String, String> {
-        let mut keys = self.keys.lock().unwrap();
-        let now = now();
-        let mut candidates: Vec<&mut KeyState> = keys.values_mut()
-            .filter(|k| provider.map_or(true, |p| k.provider == p))
+        let guard = self.inner.lock().unwrap();
+        let available: Vec<&DiscoveredWorker> = guard
+            .workers
+            .iter()
+            .filter(|w| !guard.down_workers.contains(&w.id))
             .collect();
-        // Sort: preferred first, then fewest inflight, then fewest window hits.
-        candidates.sort_by(|a, b| {
-            let a_pref = prefer.map_or(false, |p| a.name == p) as usize;
-            let b_pref = prefer.map_or(false, |p| b.name == p) as usize;
-            b_pref.cmp(&a_pref)
-                .then_with(|| a.inflight.cmp(&b.inflight))
-                .then_with(|| a.window.len().cmp(&b.window.len()))
+
+        available
+            .iter()
+            .find(|w| {
+                w.id == guard.default_worker && (w.key_slot.is_none() || w.agent == "pi")
+            })
+            .or_else(|| {
+                available
+                    .iter()
+                    .find(|w| w.agent == "pi" && w.key_slot.is_none())
+            })
+            .or_else(|| available.iter().find(|w| w.key_slot.is_none()))
+            .or_else(|| available.first())
+            .map(|w| (*w).clone())
+    }
+
+    pub fn find_fallback_worker(
+        &self,
+        exclude_keys: &BTreeSet<String>,
+        prefer_provider: Option<&str>,
+    ) -> Option<DiscoveredWorker> {
+        let guard = self.inner.lock().unwrap();
+        let now = now_sec();
+        let routable: Vec<&DiscoveredWorker> = guard
+            .workers
+            .iter()
+            .filter(|w| {
+                if guard.down_workers.contains(&w.id) {
+                    return false;
+                }
+                let Some(slot) = &w.key_slot else {
+                    return false;
+                };
+                if exclude_keys.contains(slot) {
+                    return false;
+                }
+                let Some(ks) = guard.keys.get(slot) else {
+                    return false;
+                };
+                now >= ks.cooling_until && ks.inflight < guard.max_inflight
+            })
+            .collect();
+
+        if let Some(prov) = prefer_provider {
+            if let Some(same) = routable.iter().find(|w| w.provider == prov) {
+                return Some((*same).clone());
+            }
+        }
+        routable.first().map(|w| (*w).clone())
+    }
+
+    pub fn lease_guard(&self, prefer: Option<&str>, provider: Option<&str>) -> Result<LeaseGuard> {
+        let key = self.lease_key_in(prefer, provider)?;
+        Ok(LeaseGuard {
+            registry: self.clone(),
+            key_name: key,
+            released: false,
+        })
+    }
+
+    pub fn lease_key_in(&self, prefer: Option<&str>, provider: Option<&str>) -> Result<String> {
+        let mut guard = self.inner.lock().unwrap();
+        let now = now_sec();
+        let max_inflight = guard.max_inflight;
+        let default_rpm = guard.rpm_limit;
+        let caps = guard.provider_rpm_caps.clone();
+
+        let mut candidate_names: Vec<String> = guard
+            .keys
+            .values()
+            .filter(|k| provider.map(|p| k.provider == p).unwrap_or(true))
+            .map(|k| k.name.clone())
+            .collect();
+
+        candidate_names.sort_by(|a, b| {
+            let ka = &guard.keys[a];
+            let kb = &guard.keys[b];
+            let a_pref = usize::from(prefer == Some(ka.name.as_str()));
+            let b_pref = usize::from(prefer == Some(kb.name.as_str()));
+            b_pref
+                .cmp(&a_pref)
+                .then(ka.inflight.cmp(&kb.inflight))
+                .then(ka.window.len().cmp(&kb.window.len()))
         });
 
-        for k in &mut candidates {
-            if now < k.cooling_until { continue; }
-            k.window.retain(|t| now - t <= 60.0);
-            if k.window.len() >= self.rpm_limit { continue; }
-            if k.inflight >= self.max_inflight { continue; }
+        for name in candidate_names {
+            let k = guard.keys.get_mut(&name).unwrap();
+            if now < k.cooling_until {
+                continue;
+            }
+            let effective_rpm = caps.get(&k.provider).copied().unwrap_or(default_rpm);
+            k.window.retain(|t| now - *t <= 60.0);
+            if k.window.len() >= effective_rpm || k.inflight >= max_inflight {
+                continue;
+            }
             k.inflight += 1;
             k.window.push(now);
             return Ok(k.name.clone());
         }
-        Err(format!("no free key (provider={}, max_inflight={}, rpm_limit={})",
-                    provider.unwrap_or("any"), self.max_inflight, self.rpm_limit))
+
+        bail!(
+            "no free key (provider={}, max_inflight={}, rpm_limit={})",
+            provider.unwrap_or("any"),
+            max_inflight,
+            provider.and_then(|p| caps.get(p).copied()).unwrap_or(default_rpm)
+        );
     }
 
-    /// Release a leased key and record outcome.
-    pub fn release_key(&self, name: &str, ok: bool) {
-        let mut keys = self.keys.lock().unwrap();
-        if let Some(k) = keys.get_mut(name) {
+    pub fn release_key(&self, name: &str, ok: bool, custom_cooldown_s: Option<u64>) {
+        let mut guard = self.inner.lock().unwrap();
+        let cooldown = custom_cooldown_s.unwrap_or(guard.cooldown_s);
+        if let Some(k) = guard.keys.get_mut(name) {
             k.inflight = k.inflight.saturating_sub(1);
-            if ok { k.ok += 1; } else { k.fail += 1; }
-            if !ok {
-                k.cooling_until = now() + self.cooldown_s;
+            if ok {
+                k.ok += 1;
+            } else {
+                k.fail += 1;
+                k.cooling_until = now_sec() + cooldown as f64;
             }
         }
     }
 
-    /// Key status snapshot for the UI.
-    pub fn key_status(&self) -> Vec<crate::types::WorkerStatus> {
-        let keys = self.keys.lock().unwrap();
-        let now = now();
-        keys.values().map(|k| {
-            let active_calls = k.window.iter().filter(|t| now - *t <= 60.0).count();
-            crate::types::WorkerStatus {
-                name: k.name.clone(),
-                status: if now < k.cooling_until { "down" } else if k.inflight > 0 { "active" } else { "idle" }.to_string(),
-                calls_24h: active_calls,
-                ok_24h: k.ok,
-                key: Some(k.name.clone()),
-            }
-        }).collect()
-    }
-}
-
-impl Default for Registry {
-    fn default() -> Self {
-        Self {
-            workers: Vec::new(),
-            keys: Mutex::new(BTreeMap::new()),
-            rpm_limit: 40,
-            cooldown_s: 60.0,
-            max_inflight: MAX_INFLIGHT,
-            lease_wait_s: 30,
-            default_worker: "pi".to_string(),
+    pub fn clear_cooldown(&self, name: &str) -> bool {
+        let mut guard = self.inner.lock().unwrap();
+        if let Some(k) = guard.keys.get_mut(name) {
+            k.cooling_until = 0.0;
+            return true;
         }
+        false
     }
-}
 
-/// In-memory run store (replaced by SQLite later).
-pub struct RunStore {
-    runs: Mutex<HashMap<String, Run>>,
-}
-
-impl RunStore {
-    pub fn new() -> Self {
-        Self { runs: Mutex::new(HashMap::new()) }
-    }
-    pub fn insert(&self, run: Run) {
-        self.runs.lock().unwrap().insert(run.id.clone(), run);
-    }
-    pub fn get(&self, id: &str) -> Option<Run> {
-        self.runs.lock().unwrap().get(id).cloned()
-    }
-    pub fn list(&self) -> Vec<Run> {
-        self.runs.lock().unwrap().values().cloned().collect()
-    }
-    pub fn set_state(&self, id: &str, state: RunState, gate_passed: Option<bool>, error: Option<String>) {
-        if let Some(r) = self.runs.lock().unwrap().get_mut(id) {
-            r.state = state;
-            r.gate_passed = gate_passed;
-            r.error = error;
+    pub fn total_rpm(&self) -> usize {
+        let mut guard = self.inner.lock().unwrap();
+        let now = now_sec();
+        let mut total = 0;
+        for k in guard.keys.values_mut() {
+            k.window.retain(|t| now - *t <= 60.0);
+            total += k.window.len();
         }
+        total
     }
-    pub fn set_pid(&self, id: &str, pid: u32) {
-        if let Some(r) = self.runs.lock().unwrap().get_mut(id) {
-            r.pid = Some(pid);
-        }
+
+    pub fn key_status(&self) -> Vec<WorkerStatus> {
+        let guard = self.inner.lock().unwrap();
+        let now = now_sec();
+        guard
+            .keys
+            .values()
+            .map(|k| {
+                let active_calls = k.window.iter().filter(|t| now - **t <= 60.0).count();
+                let cooling_left = if k.cooling_until > now {
+                    (k.cooling_until - now).ceil() as u64
+                } else {
+                    0
+                };
+                let status = if cooling_left > 0 {
+                    "down"
+                } else if k.inflight > 0 {
+                    "active"
+                } else {
+                    "idle"
+                };
+                let rpm_limit = guard
+                    .provider_rpm_caps
+                    .get(&k.provider)
+                    .copied()
+                    .unwrap_or(guard.rpm_limit);
+                WorkerStatus {
+                    name: k.name.clone(),
+                    status: status.to_string(),
+                    calls_24h: active_calls,
+                    ok_24h: k.ok,
+                    key: Some(k.name.clone()),
+                    provider: Some(k.provider.clone()),
+                    cooling_remaining_s: cooling_left,
+                    rpm_limit,
+                    inflight: k.inflight,
+                }
+            })
+            .collect()
     }
-}
-
-impl Default for RunStore {
-    fn default() -> Self { Self::new() }
-}
-
-fn now() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::Discovery;
+    use crate::types::Provider;
 
-    fn mk_discovery() -> Discovery {
-        Discovery {
-            agents: vec![crate::types::Agent { id: "pi".to_string(), path: Some("/usr/bin/pi".to_string()) }],
-            keys: BTreeMap::from([
-                ("nim".to_string(), vec!["NIM_1".to_string(), "NIM_2".to_string()]),
-                ("groq".to_string(), vec!["GROQ_API_KEY".to_string()]),
-            ]),
-            providers: BTreeMap::new(),
-            library_dirs: Vec::new(),
-            ssh_hosts: Vec::new(),
-            git_projects: Vec::new(),
-            browsers: Vec::new(),
+    fn sample_discovery() -> DiscoveryData {
+        let mut keys = BTreeMap::new();
+        keys.insert("nim".into(), vec!["NIM_1".into(), "NIM_2".into()]);
+        keys.insert("groq".into(), vec!["GROQ_API_KEY".into()]);
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "nim".into(),
+            Provider {
+                id: "nim".into(),
+                base_url: "https://integrate.api.nvidia.com/v1".into(),
+                style: Some("openai".into()),
+            },
+        );
+        DiscoveryData {
+            agents: vec![],
+            keys,
+            providers,
+            library_dirs: vec![],
+            ssh_hosts: vec![],
+            git_projects: vec![],
+            browsers: vec![],
         }
     }
 
     #[test]
-    fn registry_builds_workers() {
-        let d = mk_discovery();
-        let reg = Registry::from_discovery(&d);
-        let ids: Vec<_> = reg.workers.iter().map(|w| w.id.clone()).collect();
-        assert!(ids.contains(&"pi:NIM_1".to_string()));
-        assert!(ids.contains(&"pi:NIM_2".to_string()));
-        assert!(ids.contains(&"groq:GROQ_API_KEY".to_string()));
+    fn raii_lease_guard_releases_on_drop() {
+        let reg = Registry::new(&sample_discovery(), &Config::default());
+        {
+            let guard = reg.lease_guard(Some("NIM_1"), Some("nim")).unwrap();
+            assert_eq!(guard.key_name(), "NIM_1");
+            let status = reg.key_status();
+            assert_eq!(
+                status.iter().find(|k| k.name == "NIM_1").unwrap().status,
+                "active"
+            );
+        } // dropped without complete()
+        let after = reg.key_status();
+        assert_eq!(
+            after.iter().find(|k| k.name == "NIM_1").unwrap().status,
+            "down"
+        );
     }
 
     #[test]
-    fn lease_and_release() {
-        let d = mk_discovery();
-        let reg = Registry::from_discovery(&d);
-        let k = reg.lease_key(Some("NIM_1")).unwrap();
-        assert_eq!(k, "NIM_1");
-        reg.release_key(&k, true);
-        // second lease should succeed after release
-        let k2 = reg.lease_key(None).unwrap();
-        assert!(!k2.is_empty());
+    fn provider_scoped_lease_never_crosses_providers() {
+        let reg = Registry::new(&sample_discovery(), &Config::default());
+        assert!(reg.lease_key_in(None, Some("openai")).is_err());
+        assert_eq!(reg.lease_key_in(None, Some("groq")).unwrap(), "GROQ_API_KEY");
     }
 
     #[test]
-    fn run_store_roundtrip() {
-        let store = RunStore::new();
-        let run = Run {
-            id: "r1".to_string(),
-            created_at: chrono::Utc::now(),
-            worker: "pi:NIM_1".to_string(),
-            caller: Some("claude".to_string()),
-            key_slot: Some("NIM_1".to_string()),
-            model: None,
-            provider: Some("nim".to_string()),
-            prompt: "hi".to_string(),
-            gate: None,
-            state: RunState::Queued,
-            pid: None,
-            elapsed_ms: None,
-            gate_passed: None,
-            error: None,
-            output: None,
-            task_class: None,
-            receipt_id: None,
-        };
-        store.insert(run.clone());
-        let got = store.get("r1").unwrap();
-        assert_eq!(got.worker, "pi:NIM_1");
-        assert_eq!(got.key_slot, Some("NIM_1".to_string()));
-    }
-
-    #[tokio::test]
-    async fn default_is_bare_pi_and_pool_spreads_over_nim_keys_only() {
-        let reg = Registry::from_discovery(&mk_discovery());
-        assert_eq!(reg.select_best_worker().unwrap().id, "pi");
-        let pi = reg.find_worker("pi").unwrap();
-        let mut seen = std::collections::BTreeMap::<String, usize>::new();
-        // 2 NIM keys x MAX_INFLIGHT = 6 slots; the 7th must wait, and GROQ must never be leased for NIM.
-        for _ in 0..(2 * MAX_INFLIGHT) {
-            let k = reg.key_for(&pi).await.unwrap().unwrap();
-            assert_ne!(k, "GROQ_API_KEY");
-            *seen.entry(k).or_default() += 1;
-        }
-        assert_eq!(seen.get("NIM_1"), Some(&MAX_INFLIGHT));
-        assert_eq!(seen.get("NIM_2"), Some(&MAX_INFLIGHT));
-        assert!(reg.lease_key_in(None, Some("nim")).is_err());
-        reg.release_key("NIM_1", true);
-        assert_eq!(reg.lease_key_in(None, Some("nim")).unwrap(), "NIM_1");
-    }
-
-    #[tokio::test]
-    async fn pinned_worker_prefers_its_slot_but_stays_in_provider() {
-        let reg = Registry::from_discovery(&mk_discovery());
-        let pinned = reg.find_worker("pi:NIM_2").unwrap();
-        assert_eq!(reg.key_for(&pinned).await.unwrap().unwrap(), "NIM_2");
+    fn provider_rpm_cap_updates_dynamically() {
+        let reg = Registry::new(&sample_discovery(), &Config::default());
+        assert!(reg.set_rpm_limit("groq", 15));
+        let groq = reg
+            .key_status()
+            .into_iter()
+            .find(|k| k.name == "GROQ_API_KEY")
+            .unwrap();
+        assert_eq!(groq.rpm_limit, 15);
     }
 }

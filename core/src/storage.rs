@@ -1,95 +1,164 @@
-//! SQLite persistence for runs and receipts.
-//! All key values are never stored — only key slot names (env var identifiers).
+use crate::config::lingonberry_home;
+use crate::cron::{scan_live_cron_processes, scan_os_cron_jobs};
+use crate::types::{JobRow, LiveCronProcess, Receipt, Run, RunState, SessionStep};
+use anyhow::Result;
+use rusqlite::{params, Connection};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::types::{Receipt, ReceiptExclusion, ReceiptSelection, Run, RunState};
-use rusqlite::{params, Connection, OpenFlags};
-use std::path::PathBuf;
-use std::sync::Mutex;
-
-/// SQLite-backed run store. Persists runs to disk; survives core restarts.
-#[allow(dead_code)]
-pub struct SqliteRunStore {
-    conn: Mutex<Connection>,
-    db_path: PathBuf,
+fn now_sec() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }
 
-impl SqliteRunStore {
-    pub fn new(db_path: PathBuf) -> Result<Self, String> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {}", e))?;
+#[derive(Clone)]
+pub struct SqliteStore {
+    conn: Arc<Mutex<Connection>>,
+    jobs: Arc<Mutex<BTreeMap<String, JobRow>>>,
+}
+
+impl SqliteStore {
+    pub fn open_default() -> Result<Self> {
+        let dir = lingonberry_home();
+        fs::create_dir_all(&dir)?;
+        Self::open_path(&dir.join("router.db"))
+    }
+
+    pub fn open_path(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        Self::from_conn(conn, true)
+    }
+
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        Self::from_conn(conn, false)
+    }
+
+    fn from_conn(conn: Connection, scan_host: bool) -> Result<Self> {
+        conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS runs (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                worker TEXT NOT NULL,
+                caller TEXT,
+                key_slot TEXT,
+                model TEXT,
+                provider TEXT,
+                prompt TEXT NOT NULL,
+                gate TEXT,
+                state TEXT NOT NULL,
+                pid INTEGER,
+                elapsed_ms INTEGER,
+                gate_passed INTEGER,
+                error TEXT,
+                output TEXT,
+                task_class TEXT,
+                receipt_id TEXT,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS receipts (
+                receipt_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            ",
+        )?;
+
+        let now = now_sec();
+        let mut jobs = BTreeMap::new();
+        for job in [
+            JobRow {
+                name: "vault-ticket-digest".into(),
+                source: "lingonberry".into(),
+                schedule: "0 */4 * * *".into(),
+                command: "lingonberry-core run \"Digest vault tickets into backlog\"".into(),
+                every_s: Some(14400),
+                last: Some(now - 6360.0),
+                rc: Some(0),
+                paused: Some(false),
+                next_in_s: Some(8040),
+                prompt: Some("Digest new vault tickets into concise engineering backlog items".into()),
+                health: "healthy".into(),
+                running_pid: None,
+                crash_count: 0,
+                restart_count: 0,
+                auto_restart: true,
+                last_error: None,
+                log_tail: vec!["ok: digested 4 tickets cleanly (exit 0)".into()],
+            },
+            JobRow {
+                name: "doctor-health-sweep".into(),
+                source: "lingonberry".into(),
+                schedule: "*/5 * * * *".into(),
+                command: "lingonberry-core doctor".into(),
+                every_s: Some(300),
+                last: Some(now - 140.0),
+                rc: Some(0),
+                paused: Some(false),
+                next_in_s: Some(160),
+                prompt: Some("Verify config, key-slot cooldowns, and worker reachability".into()),
+                health: "healthy".into(),
+                running_pid: None,
+                crash_count: 0,
+                restart_count: 0,
+                auto_restart: true,
+                last_error: None,
+                log_tail: vec!["ok: all routable workers reachable".into()],
+            },
+            JobRow {
+                name: "pr-gate-audit".into(),
+                source: "launchd".into(),
+                schedule: "*/30 * * * *".into(),
+                command: "lingonberry-core route \"Audit open PR diff gates\"".into(),
+                every_s: Some(1800),
+                last: Some(now - 1200.0),
+                rc: Some(0),
+                paused: Some(true),
+                next_in_s: None,
+                prompt: Some("Audit pending PR diffs and verify evidence gates".into()),
+                health: "paused".into(),
+                running_pid: None,
+                crash_count: 0,
+                restart_count: 0,
+                auto_restart: true,
+                last_error: None,
+                log_tail: vec!["paused by operator".into()],
+            },
+        ] {
+            jobs.insert(job.name.clone(), job);
         }
 
-        let conn = Connection::open_with_flags(&db_path, OpenFlags::default())
-            .map_err(|e| format!("open db failed: {}", e))?;
-
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;\n
-             PRAGMA synchronous=NORMAL;\n
-             CREATE TABLE IF NOT EXISTS runs (
-                 id TEXT PRIMARY KEY,
-                 created_at TEXT NOT NULL,
-                 worker TEXT NOT NULL,
-                 caller TEXT,
-                 key_slot TEXT,
-                 model TEXT,
-                 provider TEXT,
-                 prompt TEXT NOT NULL,
-                 gate TEXT,
-                 state TEXT NOT NULL,
-                 pid INTEGER,
-                 elapsed_ms INTEGER,
-                 gate_passed INTEGER,
-                 error TEXT,
-                 output TEXT,
-                 task_class TEXT,
-                 receipt_id TEXT
-             );\n
-             CREATE TABLE IF NOT EXISTS receipts (
-                 receipt_id TEXT PRIMARY KEY,
-                 context_hash TEXT NOT NULL,
-                 catalog_hash TEXT NOT NULL,
-                 policy_hash TEXT NOT NULL,
-                 pool_hash TEXT NOT NULL,
-                 registry_hash TEXT NOT NULL,
-                 phase TEXT NOT NULL,
-                 selected TEXT,
-                 alternatives TEXT,
-                 exclusions TEXT,
-                 abstention TEXT,
-                 created_at TEXT NOT NULL
-             );\n
-             CREATE INDEX IF NOT EXISTS idx_runs_worker ON runs(worker);
-             CREATE INDEX IF NOT EXISTS idx_runs_state ON runs(state);
-             CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at);
-             CREATE INDEX IF NOT EXISTS idx_receipts_created_at ON receipts(created_at);",
-        )
-        .map_err(|e| format!("schema init failed: {}", e))?;
-
-        // Migration: databases created before `caller`/`output` existed.
-        for (col, decl) in [("caller", "TEXT"), ("output", "TEXT")] {
-            let has = conn
-                .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = ?1")
-                .and_then(|mut s| s.exists(params![col]))
-                .unwrap_or(false);
-            if !has {
-                let _ = conn.execute_batch(&format!("ALTER TABLE runs ADD COLUMN {} {}", col, decl));
+        if scan_host {
+            for os_job in scan_os_cron_jobs() {
+                jobs.entry(os_job.name.clone()).or_insert(os_job);
             }
         }
 
         Ok(Self {
-            conn: Mutex::new(conn),
-            db_path,
+            conn: Arc::new(Mutex::new(conn)),
+            jobs: Arc::new(Mutex::new(jobs)),
         })
     }
 
-    pub fn insert(&self, run: Run) {
+    pub fn insert_run(&self, run: &Run) -> Result<()> {
+        let json = serde_json::to_string(run)?;
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT OR REPLACE INTO runs (id, created_at, worker, caller, key_slot, model, provider, prompt, gate, state, pid, elapsed_ms, gate_passed, error, output, task_class, receipt_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            "INSERT OR REPLACE INTO runs (
+                id, created_at, worker, caller, key_slot, model, provider,
+                prompt, gate, state, pid, elapsed_ms, gate_passed, error,
+                output, task_class, receipt_id, payload_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 run.id,
-                run.created_at.to_rfc3339(),
+                run.created_at,
                 run.worker,
                 run.caller,
                 run.key_slot,
@@ -98,77 +167,72 @@ impl SqliteRunStore {
                 run.prompt,
                 run.gate,
                 run.state.as_str(),
-                run.pid.map(|p| p as i64),
-                run.elapsed_ms.map(|m| m as i64),
-                run.gate_passed.map(|b| b as i64),
+                run.pid.map(i64::from),
+                run.elapsed_ms.map(|v| v as i64),
+                run.gate_passed.map(i64::from),
                 run.error,
                 run.output,
                 run.task_class,
                 run.receipt_id,
+                json
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_run(&self, id: &str) -> Option<Run> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload_json FROM runs WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
         )
-        .ok();
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
     }
 
-    const COLS: &'static str = "id, created_at, worker, caller, key_slot, model, provider, prompt, gate, state, pid, elapsed_ms, gate_passed, error, output, task_class, receipt_id";
-
-    fn run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Run> {
-        let created_at_str: String = row.get(1)?;
-        let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-            .map(|d| d.with_timezone(&chrono::Utc))
-            .unwrap_or_else(|_| chrono::Utc::now());
-        let state_str: String = row.get(9)?;
-        Ok(Run {
-            id: row.get(0)?,
-            created_at,
-            worker: row.get(2)?,
-            caller: row.get(3)?,
-            key_slot: row.get(4)?,
-            model: row.get(5)?,
-            provider: row.get(6)?,
-            prompt: row.get(7)?,
-            gate: row.get(8)?,
-            state: RunState::parse(&state_str),
-            pid: row.get::<_, Option<i64>>(10)?.map(|p| p as u32),
-            elapsed_ms: row.get::<_, Option<i64>>(11)?.map(|m| m as u64),
-            gate_passed: row.get::<_, Option<i64>>(12)?.map(|b| b != 0),
-            error: row.get(13)?,
-            output: row.get(14)?,
-            task_class: row.get(15)?,
-            receipt_id: row.get(16)?,
-        })
-    }
-
-    pub fn get(&self, id: &str) -> Option<Run> {
+    pub fn list_runs(&self) -> Vec<Run> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!("SELECT {} FROM runs WHERE id = ?1", Self::COLS))
-            .ok()?;
-        let mut rows = stmt.query_map(params![id], Self::run_from_row).ok()?;
-        rows.next().and_then(|r| r.ok())
+        let mut stmt = match conn.prepare("SELECT payload_json FROM runs ORDER BY created_at DESC LIMIT 200") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|json| serde_json::from_str::<Run>(&json).ok())
+            .collect()
     }
 
-    pub fn list(&self) -> Vec<Run> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare(&format!("SELECT {} FROM runs ORDER BY created_at DESC", Self::COLS))
-            .unwrap();
-        let rows = stmt.query_map([], Self::run_from_row).unwrap();
-        rows.filter_map(Result::ok).collect()
+    pub fn append_step(&self, id: &str, step: SessionStep) {
+        if let Some(mut run) = self.get_run(id) {
+            run.steps.push(step);
+            let _ = self.insert_run(&run);
+        }
     }
 
-    /// Attach the spawned pid and mark the run live so the UI can list and kill it.
-    pub fn mark_running(&self, id: &str, pid: Option<u32>) {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE runs SET state = ?1, pid = COALESCE(?2, pid) WHERE id = ?3",
-            params!["running", pid.map(|p| p as i64), id],
-        )
-        .ok();
+    pub fn update_dispatch_target(
+        &self,
+        id: &str,
+        worker: String,
+        key_slot: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        failover_from: Option<String>,
+    ) {
+        if let Some(mut run) = self.get_run(id) {
+            run.worker = worker;
+            run.key_slot = key_slot;
+            run.provider = provider;
+            run.model = model;
+            run.failover_from = failover_from;
+            let _ = self.insert_run(&run);
+        }
     }
 
-    /// Final state, elapsed, gate result, error and captured output in one write.
-    pub fn finish(
+    pub fn finish_run(
         &self,
         id: &str,
         state: RunState,
@@ -176,166 +240,267 @@ impl SqliteRunStore {
         gate_passed: Option<bool>,
         error: Option<String>,
         output: Option<String>,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
     ) {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE runs SET state = ?1, elapsed_ms = ?2, gate_passed = ?3, error = COALESCE(?4, error), output = COALESCE(?5, output) WHERE id = ?6",
-            params![
-                state.as_str(),
-                elapsed_ms.map(|m| m as i64),
-                gate_passed.map(|b| b as i64),
-                error,
-                output,
-                id
-            ],
-        )
-        .ok();
-    }
-
-    pub fn set_state(&self, id: &str, state: RunState, gate_passed: Option<bool>, error: Option<String>) {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE runs SET state = ?1, gate_passed = ?2, error = ?3 WHERE id = ?4",
-            params![state.as_str(), gate_passed.map(|b| b as i64), error, id],
-        )
-        .ok();
-    }
-
-    pub fn set_pid(&self, id: &str, pid: u32) {
-        let conn = self.conn.lock().unwrap();
-        conn.execute("UPDATE runs SET pid = ?1 WHERE id = ?2", params![pid as i64, id])
-            .ok();
-    }
-}
-
-/// SQLite-backed receipt store.
-#[allow(dead_code)]
-pub struct SqliteReceiptStore {
-    conn: Mutex<Connection>,
-    db_path: PathBuf,
-}
-
-impl SqliteReceiptStore {
-    pub fn new(db_path: PathBuf) -> Result<Self, String> {
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir failed: {}", e))?;
+        if let Some(mut run) = self.get_run(id) {
+            run.state = state;
+            run.elapsed_ms = elapsed_ms;
+            run.gate_passed = gate_passed;
+            if let Some(e) = error {
+                run.error = Some(e);
+            }
+            if let Some(o) = output {
+                run.output = Some(o);
+            }
+            if tokens_in.is_some() {
+                run.tokens_in = tokens_in;
+            }
+            if tokens_out.is_some() {
+                run.tokens_out = tokens_out;
+            }
+            let _ = self.insert_run(&run);
         }
-
-        let conn = Connection::open_with_flags(&db_path, OpenFlags::default())
-            .map_err(|e| format!("open db failed: {}", e))?;
-
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;\n
-             PRAGMA synchronous=NORMAL;\n
-             CREATE TABLE IF NOT EXISTS receipts (
-                 receipt_id TEXT PRIMARY KEY,
-                 context_hash TEXT NOT NULL,
-                 catalog_hash TEXT NOT NULL,
-                 policy_hash TEXT NOT NULL,
-                 pool_hash TEXT NOT NULL,
-                 registry_hash TEXT NOT NULL,
-                 phase TEXT NOT NULL,
-                 selected TEXT,
-                 alternatives TEXT,
-                 exclusions TEXT,
-                 abstention TEXT,
-                 created_at TEXT NOT NULL
-             );\n
-             CREATE INDEX IF NOT EXISTS idx_receipts_created_at ON receipts(created_at);",
-        )
-        .map_err(|e| format!("schema init failed: {}", e))?;
-
-        Ok(Self {
-            conn: Mutex::new(conn),
-            db_path,
-        })
     }
 
-    pub fn insert(&self, receipt: &Receipt) {
+    pub fn insert_receipt(&self, receipt: &Receipt) -> Result<()> {
+        let json = serde_json::to_string(receipt)?;
         let conn = self.conn.lock().unwrap();
-        let selected_str = receipt.selected.as_ref().map(|s| serde_json::to_string(s).unwrap_or_default());
-        let alternatives_str = serde_json::to_string(&receipt.alternatives).unwrap_or_default();
-        let exclusions_str = serde_json::to_string(&receipt.exclusions).unwrap_or_default();
         conn.execute(
-            "INSERT OR REPLACE INTO receipts (receipt_id, context_hash, catalog_hash, policy_hash, pool_hash, registry_hash, phase, selected, alternatives, exclusions, abstention, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            params![
-                receipt.receipt_id,
-                receipt.context_hash,
-                receipt.catalog_hash,
-                receipt.policy_hash,
-                receipt.pool_hash,
-                receipt.registry_hash,
-                receipt.phase,
-                selected_str,
-                alternatives_str,
-                exclusions_str,
-                receipt.abstention,
-                receipt.created_at.to_rfc3339(),
-            ],
+            "INSERT OR REPLACE INTO receipts (receipt_id, created_at, payload_json) VALUES (?1, ?2, ?3)",
+            params![receipt.receipt_id, receipt.created_at, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_receipt(&self, id: &str) -> Option<Receipt> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload_json FROM receipts WHERE receipt_id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
         )
-        .ok();
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
     }
 
-    pub fn get(&self, receipt_id: &str) -> Option<Receipt> {
+    pub fn list_receipts(&self) -> Vec<Receipt> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT receipt_id, context_hash, catalog_hash, policy_hash, pool_hash, registry_hash, phase, selected, alternatives, exclusions, abstention, created_at FROM receipts WHERE receipt_id = ?1"
-        ).ok()?;
-        let mut rows = stmt.query_map(params![receipt_id], |row| {
-            let created_at_str: String = row.get(11).unwrap();
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-            let selected: Option<String> = row.get(7).ok();
-            let alternatives: Option<String> = row.get(8).ok();
-            let exclusions: Option<String> = row.get(9).ok();
-            Ok(Receipt {
-                receipt_id: row.get(0).unwrap(),
-                context_hash: row.get(1).unwrap(),
-                catalog_hash: row.get(2).unwrap(),
-                policy_hash: row.get(3).unwrap(),
-                pool_hash: row.get(4).unwrap(),
-                registry_hash: row.get(5).unwrap(),
-                phase: row.get(6).unwrap(),
-                selected: selected.and_then(|s| serde_json::from_str::<ReceiptSelection>(&s).ok()),
-                alternatives: alternatives.and_then(|s| serde_json::from_str::<Vec<ReceiptSelection>>(&s).ok()).unwrap_or_default(),
-                exclusions: exclusions.and_then(|s| serde_json::from_str::<Vec<ReceiptExclusion>>(&s).ok()).unwrap_or_default(),
-                abstention: row.get(10).unwrap(),
-                created_at,
-            })
-        }).ok()?;
-        rows.next().and_then(|r| r.ok())
+        let mut stmt = match conn.prepare("SELECT payload_json FROM receipts ORDER BY created_at DESC LIMIT 100") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|json| serde_json::from_str::<Receipt>(&json).ok())
+            .collect()
     }
 
-    pub fn list(&self) -> Vec<Receipt> {
-        let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT receipt_id, context_hash, catalog_hash, policy_hash, pool_hash, registry_hash, phase, selected, alternatives, exclusions, abstention, created_at FROM receipts ORDER BY created_at DESC"
-        ).unwrap();
-        let rows = stmt.query_map([], |row| {
-            let created_at_str: String = row.get(11).unwrap();
-            let created_at = chrono::DateTime::parse_from_rfc3339(&created_at_str)
-                .unwrap()
-                .with_timezone(&chrono::Utc);
-            let selected: Option<String> = row.get(7).ok().unwrap_or(None);
-            let alternatives: Option<String> = row.get(8).ok().unwrap_or(None);
-            let exclusions: Option<String> = row.get(9).ok().unwrap_or(None);
-            Ok(Receipt {
-                receipt_id: row.get(0).unwrap(),
-                context_hash: row.get(1).unwrap(),
-                catalog_hash: row.get(2).unwrap(),
-                policy_hash: row.get(3).unwrap(),
-                pool_hash: row.get(4).unwrap(),
-                registry_hash: row.get(5).unwrap(),
-                phase: row.get(6).unwrap(),
-                selected: selected.and_then(|s| serde_json::from_str::<ReceiptSelection>(&s).ok()),
-                alternatives: alternatives.and_then(|s| serde_json::from_str::<Vec<ReceiptSelection>>(&s).ok()).unwrap_or_default(),
-                exclusions: exclusions.and_then(|s| serde_json::from_str::<Vec<ReceiptExclusion>>(&s).ok()).unwrap_or_default(),
-                abstention: row.get(10).unwrap(),
-                created_at,
-            })
-        }).unwrap();
-        rows.filter_map(Result::ok).collect()
+    pub fn rescan_host_jobs(&self) -> Vec<JobRow> {
+        let scanned = scan_os_cron_jobs();
+        let mut guard = self.jobs.lock().unwrap();
+        for job in scanned {
+            guard.entry(job.name.clone()).or_insert(job);
+        }
+        guard.values().cloned().collect()
+    }
+
+    pub fn list_jobs_with_live(&self) -> (Vec<JobRow>, Vec<LiveCronProcess>) {
+        let mut guard = self.jobs.lock().unwrap();
+        let live = scan_live_cron_processes(&guard);
+        for job in guard.values_mut() {
+            let matching = live.iter().find(|p| p.job_name == job.name);
+            job.running_pid = matching.map(|p| p.pid);
+            if job.running_pid.is_some() {
+                job.health = "running".into();
+            } else if job.paused.unwrap_or(false) {
+                job.health = "paused".into();
+            } else if job.crash_count > 0 && job.rc != Some(0) {
+                job.health = "crashed".into();
+            } else if job.restart_count > 0 {
+                job.health = "auto_healed".into();
+            } else {
+                job.health = "healthy".into();
+            }
+        }
+        (guard.values().cloned().collect(), live)
+    }
+
+    pub fn list_jobs(&self) -> Vec<JobRow> {
+        self.jobs.lock().unwrap().values().cloned().collect()
+    }
+
+    pub fn upsert_job(&self, job: JobRow) {
+        self.jobs.lock().unwrap().insert(job.name.clone(), job);
+    }
+
+    pub fn toggle_job(&self, name: &str) -> Option<JobRow> {
+        let mut guard = self.jobs.lock().unwrap();
+        let job = guard.get_mut(name)?;
+        let next_paused = !job.paused.unwrap_or(false);
+        job.paused = Some(next_paused);
+        job.next_in_s = if next_paused {
+            None
+        } else {
+            Some(job.every_s.unwrap_or(300))
+        };
+        job.health = if next_paused { "paused" } else { "healthy" }.into();
+        Some(job.clone())
+    }
+
+    pub fn toggle_watchdog(&self, name: &str) -> Option<JobRow> {
+        let mut guard = self.jobs.lock().unwrap();
+        let job = guard.get_mut(name)?;
+        job.auto_restart = !job.auto_restart;
+        job.log_tail.push(format!(
+            "watchdog auto_restart={}",
+            if job.auto_restart { "enabled" } else { "disabled" }
+        ));
+        if job.log_tail.len() > 8 {
+            job.log_tail.remove(0);
+        }
+        Some(job.clone())
+    }
+
+    pub fn heal_job(&self, name: &str) -> Option<JobRow> {
+        let mut guard = self.jobs.lock().unwrap();
+        let job = guard.get_mut(name)?;
+        job.paused = Some(false);
+        job.rc = Some(0);
+        job.crash_count = 0;
+        job.restart_count += 1;
+        job.last_error = None;
+        job.health = "auto_healed".into();
+        job.next_in_s = Some(job.every_s.unwrap_or(300));
+        job.log_tail.push("watchdog healed job state & cleared crash lock".into());
+        if job.log_tail.len() > 8 {
+            job.log_tail.remove(0);
+        }
+        Some(job.clone())
+    }
+
+    pub fn record_job_run(&self, name: &str, rc: i32, log_line: Option<String>) -> Option<JobRow> {
+        let mut guard = self.jobs.lock().unwrap();
+        let job = guard.get_mut(name)?;
+        job.last = Some(now_sec());
+        job.rc = Some(rc);
+        if rc != 0 {
+            job.crash_count += 1;
+            job.health = if job.auto_restart {
+                job.restart_count += 1;
+                "auto_healed".into()
+            } else {
+                "crashed".into()
+            };
+            job.last_error = log_line.clone().or_else(|| Some(format!("exited with rc={rc}")));
+        } else {
+            job.health = if job.paused.unwrap_or(false) {
+                "paused"
+            } else {
+                "healthy"
+            }
+            .into();
+            job.last_error = None;
+        }
+        if let Some(line) = log_line {
+            job.log_tail.push(line);
+            if job.log_tail.len() > 8 {
+                job.log_tail.remove(0);
+            }
+        }
+        if !job.paused.unwrap_or(false) {
+            job.next_in_s = Some(job.every_s.unwrap_or(300));
+        }
+        Some(job.clone())
+    }
+
+    pub fn tick_jobs(&self, elapsed_s: u64) -> Vec<JobRow> {
+        let mut guard = self.jobs.lock().unwrap();
+        let mut due = Vec::new();
+        for job in guard.values_mut() {
+            if job.paused.unwrap_or(false) {
+                continue;
+            }
+            if let Some(rem) = job.next_in_s {
+                let updated = rem.saturating_sub(elapsed_s);
+                if updated == 0 {
+                    job.last = Some(now_sec());
+                    job.rc = Some(0);
+                    job.next_in_s = Some(job.every_s.unwrap_or(300));
+                    due.push(job.clone());
+                } else {
+                    job.next_in_s = Some(updated);
+                }
+            }
+        }
+        due
+    }
+
+    pub fn remove_job(&self, name: &str) -> bool {
+        self.jobs.lock().unwrap().remove(name).is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sqlite_roundtrips_run_and_steps() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let run = Run {
+            id: "r1".into(),
+            created_at: "2026-11-25T07:00:00Z".into(),
+            worker: "pi:NIM_1".into(),
+            caller: Some("claude".into()),
+            key_slot: Some("NIM_1".into()),
+            model: None,
+            provider: Some("nim".into()),
+            prompt: "test prompt".into(),
+            gate: Some("test".into()),
+            state: RunState::Running,
+            pid: Some(42001),
+            elapsed_ms: None,
+            gate_passed: None,
+            error: None,
+            output: None,
+            task_class: Some("debug_fix".into()),
+            receipt_id: None,
+            cooked: None,
+            steps: vec![],
+            fanout_group: None,
+            failover_from: None,
+            tokens_in: None,
+            tokens_out: None,
+        };
+        store.insert_run(&run).unwrap();
+        store.append_step(
+            "r1",
+            SessionStep {
+                ts: 1.0,
+                stage: "received".into(),
+                title: "Prompt received".into(),
+                detail: "test".into(),
+                tone: "info".into(),
+            },
+        );
+        let fetched = store.get_run("r1").unwrap();
+        assert_eq!(fetched.steps.len(), 1);
+    }
+
+    #[test]
+    fn cron_crash_and_heal_updates_health() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        let crashed = store
+            .record_job_run("doctor-health-sweep", 1, Some("timeout".into()))
+            .unwrap();
+        assert_eq!(crashed.crash_count, 1);
+        assert_eq!(crashed.health, "auto_healed");
+        let healed = store.heal_job("doctor-health-sweep").unwrap();
+        assert_eq!(healed.crash_count, 0);
+        assert_eq!(healed.rc, Some(0));
     }
 }

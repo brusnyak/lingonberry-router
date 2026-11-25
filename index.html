@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lingonberry Router — Cross-OS AI Agent Orchestration</title>
+    <meta
+      name="description"
+      content="Local AI agent router for worker discovery, global-first self-configuration, prompt cooking, key-slot leasing, and host cron oversight."
+    />
+    <meta property="og:title" content="Lingonberry Router" />
+    <meta
+      property="og:description"
+      content="One local router for every AI agent. Scan once, self-configure globally, cook raw prompts, lease keys safely, and oversee live workers and cron jobs."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <script>
+      (function () {
+        try {
+          var saved = localStorage.getItem('lingonberry-theme') || 'system';
+          var prefersDark =
+            window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+          var isDark = saved === 'dark' || (saved === 'system' && prefersDark);
+          document.documentElement.classList.toggle('dark', isDark);
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body
+    class="bg-[#f4f5f7] text-zinc-900 dark:bg-[#090b0e] dark:text-slate-200 antialiased selection:bg-sky-500/20"
+  >
+    <div id="root"></div>
+    <script type="module" src="/src/client/main.tsx"></script>
+  </body>
+</html>
