@@ -20,15 +20,14 @@ use std::time::Instant;
 
 /// Run history and receipts: ~/.lingonberry/lingonberry.db.
 fn default_db_path() -> PathBuf {
-    let home = env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    Path::new(&home).join(".lingonberry").join("lingonberry.db")
+    lingonberry_core::config::state_dir().join("lingonberry.db")
 }
 
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("usage: lingonberry-core <discover|route|run|fanout|serve> [args]");
+        eprintln!("usage: lingonberry-core <init|doctor|discover|route|run|fanout|serve> [args]");
         std::process::exit(2);
     }
     match args[1].as_str() {
@@ -37,10 +36,134 @@ async fn main() {
         "route" => cmd_route(&args).await,
         "run" => cmd_run(&args).await,
         "fanout" => cmd_fanout(&args).await,
+        "init" => cmd_init(&args),
+        "doctor" => cmd_doctor(),
         other => {
             eprintln!("unknown subcommand: {}", other);
             std::process::exit(2);
         }
+    }
+}
+
+/// Load the self-config. First run writes ~/.lingonberry/config.json and logs it; an invalid file stops the router
+/// with the exact problems, so nothing runs on a config it cannot trust.
+fn load_config_or_init() -> lingonberry_core::config::Config {
+    use lingonberry_core::config::{self, LoadError};
+    match config::load() {
+        Ok(c) => c,
+        Err(LoadError::Missing) => match config::init(false) {
+            Ok((c, created)) => {
+                lingonberry_core::events::log("config.init", serde_json::json!({
+                    "created": created, "path": config::config_path().display().to_string(),
+                }));
+                c
+            }
+            Err(e) => {
+                eprintln!("config: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Err(LoadError::Invalid(p)) => {
+            eprintln!("config invalid ({}): {}", config::config_path().display(), p.join("; "));
+            std::process::exit(1);
+        }
+        Err(LoadError::Unreadable(e)) => {
+            eprintln!("config unreadable: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_init(args: &[String]) {
+    let force = args.iter().any(|a| a == "--force");
+    match lingonberry_core::config::init(force) {
+        Ok((cfg, created)) => {
+            lingonberry_core::events::log("config.init", serde_json::json!({
+                "created": created, "forced": force,
+                "path": lingonberry_core::config::config_path().display().to_string(),
+            }));
+            let out = serde_json::json!({
+                "config_path": lingonberry_core::config::config_path().display().to_string(),
+                "logs_dir": lingonberry_core::config::logs_dir().display().to_string(),
+                "created": created,
+                "config": cfg,
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        }
+        Err(e) => {
+            eprintln!("init failed: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Read-only health check. Prints one JSON document; exits 1 if any check fails. Never prints key values.
+fn cmd_doctor() {
+    use lingonberry_core::config::{self, LoadError};
+    let mut checks: Vec<(String, bool, String)> = Vec::new();
+
+    let state = config::state_dir();
+    let writable = std::fs::create_dir_all(config::logs_dir()).is_ok()
+        && std::fs::OpenOptions::new().create(true).append(true).open(config::logs_dir().join(".doctor-write-test")).is_ok();
+    let _ = std::fs::remove_file(config::logs_dir().join(".doctor-write-test"));
+    checks.push(("state_dir_writable".into(), writable, state.display().to_string()));
+
+    let cfg = match config::load() {
+        Ok(c) => {
+            checks.push(("config".into(), true, config::config_path().display().to_string()));
+            Some(c)
+        }
+        Err(LoadError::Missing) => {
+            checks.push(("config".into(), false, "missing: run `lingonberry-core init`".into()));
+            None
+        }
+        Err(LoadError::Invalid(p)) => {
+            checks.push(("config".into(), false, p.join("; ")));
+            None
+        }
+        Err(LoadError::Unreadable(e)) => {
+            checks.push(("config".into(), false, e));
+            None
+        }
+    };
+
+    let db = default_db_path();
+    let db_ok = SqliteRunStore::new(db.clone()).is_ok();
+    checks.push(("database".into(), db_ok, db.display().to_string()));
+
+    match Discovery::scan() {
+        Ok(d) => {
+            let cfg_ref = cfg.clone().unwrap_or_default();
+            let reg = Registry::from_discovery_with(&d, &cfg_ref);
+            let agents: Vec<String> = d.agents.iter().map(|a| a.id.clone()).collect();
+            checks.push(("agents".into(), !agents.is_empty(), agents.join(", ")));
+            let keys: Vec<String> = d.keys.iter().map(|(p, names)| format!("{}: {}", p, names.join(", "))).collect();
+            checks.push(("key_names".into(), !keys.is_empty(), if keys.is_empty() { "none found".into() } else { keys.join(" | ") }));
+            let dw = cfg_ref.default_worker.clone();
+            let found = reg.find_worker(&dw).is_some() || reg.select_best_worker().is_some();
+            checks.push(("default_worker".into(), found, format!("configured {} · routable {}", dw,
+                reg.select_best_worker().map(|w| w.id).unwrap_or_else(|| "none".into()))));
+            checks.push(("excluded_agents".into(), true, cfg_ref.excluded_agents.join(", ")));
+        }
+        Err(e) => checks.push(("discovery".into(), false, e)),
+    }
+
+    let port = cfg.as_ref().map(|c| c.port).unwrap_or(8799);
+    let busy = std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{}", port).parse().unwrap(), std::time::Duration::from_millis(300)).is_ok();
+    checks.push(("port".into(), true, if busy { format!("127.0.0.1:{} in use (a router is probably running)", port) } else { format!("127.0.0.1:{} free", port) }));
+
+    let all_ok = checks.iter().all(|(_, ok, _)| *ok);
+    lingonberry_core::events::log("doctor.run", serde_json::json!({
+        "ok": all_ok, "failed": checks.iter().filter(|c| !c.1).map(|c| c.0.clone()).collect::<Vec<_>>(),
+    }));
+    let out = serde_json::json!({
+        "ok": all_ok,
+        "checks": checks.iter().map(|(n, ok, d)| serde_json::json!({"check": n, "ok": ok, "detail": d})).collect::<Vec<_>>(),
+    });
+    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+    if !all_ok {
+        std::process::exit(1);
     }
 }
 
@@ -67,10 +190,12 @@ fn cmd_discover() {
 }
 
 async fn cmd_serve(args: &[String]) {
+    // The config is loaded (and created on first run) below, before the registry is built.
+    let port = lingonberry_core::config::load().map(|c| c.port).unwrap_or(8799);
     let addr: SocketAddr = if args.len() > 2 {
-        SocketAddr::from_str(&args[2]).unwrap_or_else(|_| "127.0.0.1:8799".parse().unwrap())
+        SocketAddr::from_str(&args[2]).unwrap_or_else(|_| format!("127.0.0.1:{}", port).parse().unwrap())
     } else {
-        "127.0.0.1:8799".parse().unwrap()
+        format!("127.0.0.1:{}", port).parse().unwrap()
     };
 
     let d = match Discovery::scan() {
@@ -80,7 +205,8 @@ async fn cmd_serve(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let registry = Registry::from_discovery(&d);
+    let cfg = load_config_or_init();
+    let registry = Registry::from_discovery_with(&d, &cfg);
     let runs = match SqliteRunStore::new(default_db_path()) {
         Ok(s) => s,
         Err(e) => {
@@ -97,6 +223,7 @@ async fn cmd_serve(args: &[String]) {
     };
 
     tracing_subscriber::fmt::init();
+    lingonberry_core::events::log("server.start", serde_json::json!({"addr": addr.to_string(), "workers": registry.workers.len()}));
     serve(addr, d, registry, runs, receipts).await;
 }
 
@@ -136,7 +263,8 @@ async fn cmd_route(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let registry = Registry::from_discovery(&d);
+    let cfg = load_config_or_init();
+    let registry = Registry::from_discovery_with(&d, &cfg);
     let workers = registry.list_workers();
 
     // --- Constraint-first filtering ---
@@ -274,7 +402,8 @@ async fn cmd_run(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let registry = Registry::from_discovery(&d);
+    let cfg = load_config_or_init();
+    let registry = Registry::from_discovery_with(&d, &cfg);
     let runs = match SqliteRunStore::new(default_db_path()) {
         Ok(s) => s,
         Err(e) => {
@@ -369,6 +498,9 @@ async fn cmd_run(args: &[String]) {
         receipt_id: receipt_id.clone(),
     });
 
+    lingonberry_core::events::log("run.start", serde_json::json!({
+        "run_id": run_id, "worker": worker.id, "key": key_slot, "caller": caller, "gate": gate, "receipt": receipt_id,
+    }));
     let started = Instant::now();
     let result = if use_worktree && worker.path.is_some() {
         run_with_worktree(&worker, key_slot.as_deref(), &prompt, auto_approve, &run_id).await
@@ -395,6 +527,10 @@ async fn cmd_run(args: &[String]) {
         runs.set_pid(&run_id, p);
     }
 
+    lingonberry_core::events::log("run.finish", serde_json::json!({
+        "run_id": run_id, "worker": worker.id, "key": key_slot, "caller": caller,
+        "state": if result.ok { "done" } else { "failed" }, "elapsed_ms": elapsed_ms,
+    }));
     // Release key.
     if let Some(ks) = &key_slot {
         registry.release_key(ks, result.ok);
@@ -702,7 +838,8 @@ async fn cmd_fanout(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let registry = Arc::new(Registry::from_discovery(&d));
+    let cfg = load_config_or_init();
+    let registry = Arc::new(Registry::from_discovery_with(&d, &cfg));
     let runs = Arc::new(SqliteRunStore::new(default_db_path()).expect("db open"));
 
     let workers: Vec<lingonberry_core::discovery::DiscoveredWorker> = registry.list_workers();

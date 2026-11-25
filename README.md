@@ -51,6 +51,8 @@ Key values are never printed. The core reads them from the process environment f
 ## CLI
 
 ```sh
+lingonberry-core init [--force]              # create ~/.lingonberry and config.json (idempotent)
+lingonberry-core doctor                      # read-only health check, JSON, exit 1 on any failure
 lingonberry-core discover                    # agents, keys (names only), workers
 lingonberry-core route "<prompt>"            # choose a worker, print the receipt; does not run
 lingonberry-core run "<prompt>" [--worker <id>] [--caller <name>] [--gate <cmd>] [--worktree] [--approve]
@@ -89,6 +91,46 @@ Check it took: `curl -s 127.0.0.1:8799/version` should show an `exe_mtime` equal
 
 Stop and restart act on the app and the router together.
 
+## Self-configuration
+
+The router configures itself. Nothing has to be set by hand.
+
+1. **First start.** `serve`, `run`, `route` and `fanout` call `load_config_or_init()`. With no config they write `~/.lingonberry/config.json` with the defaults and log `config.init`. `init` does the same on demand.
+2. **Validation.** A config that fails validation stops the router with the exact problems (for example `max_inflight_per_key must be at least 1`). It never runs on a config it cannot trust.
+3. **Doctor.** `lingonberry-core doctor` checks the state directory, the config, the database, discovered agents, key names (never values), the default worker, excluded agents and the port. It prints one JSON document and exits 1 on any failure.
+
+`~/.lingonberry/config.json` (version 1):
+
+| Key | Default | Meaning |
+|---|---|---|
+| `port` | 8799 | port for `serve` when no address is given |
+| `default_worker` | `pi` | worker used when a run names none (must be routable) |
+| `max_inflight_per_key` | 3 | concurrent runs per key slot |
+| `rpm_per_key` | 40 | calls per key slot per 60 s |
+| `cooldown_s` | 60 | rest after a failed call on a key slot |
+| `lease_wait_s` | 30 | seconds a dispatch waits for a free key before it fails |
+| `excluded_agents` | `["cline"]` | discovered but never routed to |
+
+Edit the file, then run `doctor`. The file is read at start, so restart `serve` after a change.
+
+State directory: `~/.lingonberry`, or `$LINGONBERRY_HOME` when set (used by tests). It holds `config.json`, `lingonberry.db`, `limits.json` and `logs/`.
+
+## Event log
+
+Every decision that matters is one JSON line in `~/.lingonberry/logs/events.jsonl`:
+
+| Event | When | Main fields |
+|---|---|---|
+| `config.init` | config created | `created`, `path` |
+| `server.start` | `serve` bound its port | `addr`, `workers` |
+| `server.shutdown` | `/shutdown` called | `pid` |
+| `run.start` | a dispatch began | `run_id`, `worker`, `key`, `caller`, `gate`, `receipt` |
+| `run.finish` | a dispatch ended | `run_id`, `worker`, `key`, `caller`, `state`, `elapsed_ms` |
+| `worker.kill` | a live worker group was signalled | `pid`, `run_id`, `worker`, `key`, `caller` |
+| `doctor.run` | doctor ran | `ok`, `failed` |
+
+Every line has `ts` (UTC, RFC 3339), `event` and `pid`. Key values are never written. Tail it with `tail -f ~/.lingonberry/logs/events.jsonl`.
+
 ## Known gaps
 
 - A worker whose output is truncated is marked `blocked`. The router does not retry it on another key yet.
@@ -96,6 +138,7 @@ Stop and restart act on the app and the router together.
 - `Lease` returns a bare key name with no RAII guard. A panic between lease and release leaks an inflight slot.
 - A poisoned registry mutex panics instead of recovering.
 - `cost_24h_usd` is not tracked.
+- `fanout` runs are not written to the event log yet (only `run`).
 - Codex is unusable until its model in `~/.codex/config.toml` is one the ChatGPT login supports.
 
 ## Layout of the repo

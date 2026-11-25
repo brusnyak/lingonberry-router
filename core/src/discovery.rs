@@ -129,8 +129,8 @@ impl Discovery {
         for agent in &self.agents {
             let id = agent.id.as_str();
             let write = matches!(id, "claude" | "codex" | "opencode" | "kilo" | "cline" | "goose" | "omp");
-            // cline runs in yolo mode and is not used as a worker: discovered, never routed to.
-            if !["pi", "nim-chat", "cline"].contains(&id) {
+            // `pi` and `nim-chat` have their own worker kinds below. Excluded agents (config) are filtered in the registry.
+            if !["pi", "nim-chat"].contains(&id) {
                 out.push(DiscoveredWorker {
                     id: id.to_string(),
                     agent: id.to_string(),

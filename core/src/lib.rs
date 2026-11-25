@@ -4,6 +4,8 @@
 //! All workers, keys, and providers are discovered at runtime; nothing is hard-coded.
 
 pub mod agents;
+pub mod config;
+pub mod events;
 pub mod discovery;
 pub mod registry;
 pub mod server;

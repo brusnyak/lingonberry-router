@@ -50,6 +50,7 @@ async fn version() -> Json<serde_json::Value> {
 async fn shutdown() -> Json<serde_json::Value> {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        crate::events::log("server.shutdown", serde_json::json!({"pid": std::process::id()}));
         std::process::exit(0);
     });
     Json(serde_json::json!({ "stopping": true, "pid": std::process::id() }))
@@ -341,6 +342,9 @@ async fn kill_worker(
             .map(|s| s.success())
             .unwrap_or(false);
     if ok {
+        crate::events::log("worker.kill", serde_json::json!({
+            "pid": pid, "run_id": run.id, "worker": run.worker, "key": run.key_slot, "caller": run.caller,
+        }));
         state.runs.set_state(
             &run.id,
             RunState::Failed,

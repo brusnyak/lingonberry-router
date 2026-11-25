@@ -28,11 +28,20 @@ pub struct Registry {
     keys: Mutex<BTreeMap<String, KeyState>>,
     rpm_limit: usize,
     cooldown_s: f64,
+    max_inflight: usize,
+    lease_wait_s: u64,
+    default_worker: String,
 }
 
 impl Registry {
     pub fn from_discovery(d: &Discovery) -> Self {
+        Self::from_discovery_with(d, &crate::config::Config::default())
+    }
+
+    /// Limits and exclusions come from the config (self-configured in ~/.lingonberry/config.json).
+    pub fn from_discovery_with(d: &Discovery, cfg: &crate::config::Config) -> Self {
         let mut workers = d.workers();
+        workers.retain(|w| !cfg.excluded_agents.iter().any(|x| x == &w.agent));
         // Deterministic order: sort by id.
         workers.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -54,8 +63,11 @@ impl Registry {
         Self {
             workers,
             keys: Mutex::new(keys),
-            rpm_limit: 40,
-            cooldown_s: 60.0,
+            rpm_limit: cfg.rpm_per_key,
+            cooldown_s: cfg.cooldown_s,
+            max_inflight: cfg.max_inflight_per_key,
+            lease_wait_s: cfg.lease_wait_s,
+            default_worker: cfg.default_worker.clone(),
         }
     }
 
@@ -71,6 +83,10 @@ impl Registry {
 
     /// Default worker: bare `pi` (pool-leased across NIM keys), then key-less CLIs, then anything.
     pub fn select_best_worker(&self) -> Option<DiscoveredWorker> {
+        // The configured default wins when it is discovered and routable.
+        if let Some(w) = self.workers.iter().find(|w| w.id == self.default_worker && (w.key_slot.is_none() || w.agent == "pi")) {
+            return Some(w.clone());
+        }
         if let Some(w) = self.workers.iter().find(|w| w.agent == "pi" && w.key_slot.is_none()) {
             return Some(w.clone());
         }
@@ -89,7 +105,7 @@ impl Registry {
         }
         let prefer = w.key_slot.clone();
         let mut last = String::new();
-        for _ in 0..30 {
+        for _ in 0..self.lease_wait_s {
             match self.lease_key_in(prefer.as_deref(), Some(&w.provider)) {
                 Ok(k) => return Ok(Some(k)),
                 Err(e) => last = e,
@@ -123,13 +139,13 @@ impl Registry {
             if now < k.cooling_until { continue; }
             k.window.retain(|t| now - t <= 60.0);
             if k.window.len() >= self.rpm_limit { continue; }
-            if k.inflight >= MAX_INFLIGHT { continue; }
+            if k.inflight >= self.max_inflight { continue; }
             k.inflight += 1;
             k.window.push(now);
             return Ok(k.name.clone());
         }
         Err(format!("no free key (provider={}, max_inflight={}, rpm_limit={})",
-                    provider.unwrap_or("any"), MAX_INFLIGHT, self.rpm_limit))
+                    provider.unwrap_or("any"), self.max_inflight, self.rpm_limit))
     }
 
     /// Release a leased key and record outcome.
@@ -168,6 +184,9 @@ impl Default for Registry {
             keys: Mutex::new(BTreeMap::new()),
             rpm_limit: 40,
             cooldown_s: 60.0,
+            max_inflight: MAX_INFLIGHT,
+            lease_wait_s: 30,
+            default_worker: "pi".to_string(),
         }
     }
 }
