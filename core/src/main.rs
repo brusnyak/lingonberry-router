@@ -160,12 +160,12 @@ async fn cmd_route(args: &[String]) {
 
     // 2. Host support: key-based workers need their env var set
     candidates.retain(|w| match &w.key_slot {
-        Some(ks) => std::env::var(ks).is_ok(),
+        Some(ks) => lingonberry_core::discovery::key_value(ks).is_some(),
         None => true, // CLI agents don't need env keys
     });
     let unkeyed: Vec<_> = workers.iter().filter(|w| {
         match &w.key_slot {
-            Some(ks) => std::env::var(ks).is_err(),
+            Some(ks) => lingonberry_core::discovery::key_value(ks).is_none(),
             None => false,
         }
     }).collect();
@@ -205,7 +205,9 @@ async fn cmd_route(args: &[String]) {
     let mut scored: Vec<(f64, &lingonberry_core::discovery::DiscoveredWorker)> = candidates
         .into_iter()
         .map(|w| {
-            let score = if w.key_slot.is_none() { 1.0 } else { 0.8 };
+            // Default is bare pi (pool across NIM keys); key-less CLIs next; pinned pi:NIM_n last.
+            let score = if w.agent == "pi" && w.key_slot.is_none() { 1.0 }
+                else if w.key_slot.is_none() { 0.9 } else { 0.8 };
             (score, w)
         })
         .collect();
@@ -303,15 +305,12 @@ async fn cmd_run(args: &[String]) {
                 std::process::exit(1);
             }
         };
-        let ks = match &w.key_slot {
-            Some(k) => match registry.lease_key(Some(k)) {
-                Ok(k2) => Some(k2),
-                Err(e) => {
-                    eprintln!("key lease failed for {}: {}", w.id, e);
-                    std::process::exit(1);
-                }
-            },
-            None => None,
+        let ks = match registry.key_for(&w).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("key lease failed for {}: {}", w.id, e);
+                std::process::exit(1);
+            }
         };
         (w, ks)
     } else {
@@ -334,15 +333,12 @@ async fn cmd_run(args: &[String]) {
         };
 
         // Lease key if the worker needs one.
-        let key_slot = match &worker.key_slot {
-            Some(ks) => match registry.lease_key(Some(ks)) {
-                Ok(k) => Some(k),
-                Err(e) => {
-                    eprintln!("key lease failed for {}: {}", worker.id, e);
-                    std::process::exit(1);
-                }
-            },
-            None => None,
+        let key_slot = match registry.key_for(&worker).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!("key lease failed for {}: {}", worker.id, e);
+                std::process::exit(1);
+            }
         };
         (worker, key_slot)
     };
@@ -376,7 +372,7 @@ async fn cmd_run(args: &[String]) {
     let result = if use_worktree && worker.path.is_some() {
         run_with_worktree(&worker, key_slot.as_deref(), &prompt, auto_approve, &run_id).await
     } else if let Some(path) = worker.path.clone() {
-        run_cli_agent_tracked(&runs, &run_id, &path, &prompt).await
+        run_cli_agent_tracked(&runs, &run_id, &worker.agent, &path, &prompt).await
     } else {
         execute_worker(&worker, key_slot.as_deref(), &prompt).await
     };
@@ -435,21 +431,32 @@ fn resolve_caller(flags: &HashMap<String, String>) -> Option<String> {
             return Some(normalize_caller(&c));
         }
     }
-    let pid = std::process::id().to_string();
-    let ppid = Command::new("/bin/ps")
-        .args(["-o", "ppid=", "-p", &pid])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().ok())?;
-    let comm = Command::new("/bin/ps")
-        .args(["-o", "comm=", "-p", &ppid.to_string()])
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-    if comm.is_empty() {
-        return None;
+    // Walk up past wrappers (timeout, env, nohup, caffeinate...) to the agent that really called us.
+    const WRAPPERS: [&str; 8] = ["timeout", "env", "nohup", "caffeinate", "sudo", "xargs", "gtimeout", "script"];
+    let own = Command::new("/bin/ps").args(["-o", "ppid=", "-p", &std::process::id().to_string()]).output().ok()?;
+    let mut pid: u32 = String::from_utf8_lossy(&own.stdout).trim().parse().ok()?;
+    let mut saw_shell = false;
+    for _ in 0..8 {
+        let out = Command::new("/bin/ps").args(["-o", "ppid=,comm=", "-p", &pid.to_string()]).output().ok()?;
+        let line = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let (ppid_s, comm) = line.split_once(char::is_whitespace)?;
+        let comm = comm.trim();
+        let base = comm.rsplit('/').next().unwrap_or(comm);
+        let ppid: u32 = ppid_s.trim().parse().ok()?;
+        if ppid <= 1 || comm.is_empty() {
+            return None;
+        }
+        // A shell is a wrapper too: `claude` runs its tools through zsh, so keep walking to the agent.
+        if WRAPPERS.contains(&base) || matches!(base, "zsh" | "bash" | "sh" | "fish" | "login") {
+            if matches!(base, "zsh" | "bash" | "sh" | "fish" | "login") {
+                saw_shell = true;
+            }
+            pid = ppid;
+            continue;
+        }
+        return Some(normalize_caller(comm));
     }
-    Some(normalize_caller(&comm))
+    if saw_shell { Some("shell".to_string()) } else { None }
 }
 
 fn normalize_caller(raw: &str) -> String {
@@ -474,16 +481,19 @@ fn truncate_output(s: &str, max: usize) -> String {
 async fn run_cli_agent_tracked(
     runs: &SqliteRunStore,
     run_id: &str,
+    agent: &str,
     path: &str,
     prompt: &str,
 ) -> WorkerResult {
     let started = Instant::now();
     let path_owned = path.to_string();
+    let agent_owned = agent.to_string();
     let prompt_owned = prompt.to_string();
     let (tx, rx) = tokio::sync::oneshot::channel::<Option<u32>>();
     let handle = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(&path_owned);
-        cmd.arg(&prompt_owned);
+        cmd.args(lingonberry_core::agents::agent_argv(&agent_owned, &prompt_owned));
+        cmd.stdin(std::process::Stdio::null()); // an agent waiting on stdin would hang the run
         cmd.process_group(0); // own group: a TERM to -pid takes the whole worker tree
         // Must be piped or wait_with_output() captures nothing (the child writes to our terminal).
         cmd.stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
@@ -710,19 +720,16 @@ async fn cmd_fanout(args: &[String]) {
         let handle = tokio::task::spawn(async move {
             // Round-robin worker selection for fanout.
             let worker = &worker_pool[idx % worker_pool.len()];
-            let key_slot = match &worker.key_slot {
-                Some(ks) => match registry.lease_key(Some(ks)) {
-                    Ok(k) => Some(k),
-                    Err(e) => {
-                        return serde_json::json!({
-                            "prompt": prompt,
-                            "worker": worker.id,
-                            "ok": false,
-                            "error": format!("key lease failed: {}", e),
-                        });
-                    }
-                },
-                None => None,
+            let key_slot = match registry.key_for(worker).await {
+                Ok(k) => k,
+                Err(e) => {
+                    return serde_json::json!({
+                        "prompt": prompt,
+                        "worker": worker.id,
+                        "ok": false,
+                        "error": format!("key lease failed: {}", e),
+                    });
+                }
             };
 
             let started = Instant::now();
@@ -795,12 +802,12 @@ async fn execute_worker(
 ) -> WorkerResult {
     // CLI agent execution: run the binary with the prompt.
     if let Some(path) = &worker.path {
-        return run_cli_agent(path, prompt).await;
+        return run_cli_agent(&worker.agent, path, prompt).await;
     }
 
     // Key-based API execution: POST to provider chat/completions.
     if let Some(ks) = key_slot {
-        if let Ok(api_key) = std::env::var(ks) {
+        if let Some(api_key) = lingonberry_core::discovery::key_value(ks) {
             return call_provider_api(worker, &api_key, prompt).await;
         }
         return WorkerResult {
@@ -825,14 +832,16 @@ async fn execute_worker(
     }
 }
 
-async fn run_cli_agent(path: &str, prompt: &str) -> WorkerResult {
+async fn run_cli_agent(agent: &str, path: &str, prompt: &str) -> WorkerResult {
     let started = Instant::now();
     let path = path.to_string();
     let prompt = prompt.to_string();
+    let agent = agent.to_string();
     let path_for_result = path.clone();
     let result = tokio::task::spawn_blocking(move || {
         let pid = match Command::new(&path)
-            .arg(&prompt)
+            .args(lingonberry_core::agents::agent_argv(&agent, &prompt))
+            .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .process_group(0)

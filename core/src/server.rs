@@ -13,7 +13,7 @@ use crate::registry::Registry;
 use crate::storage::{SqliteReceiptStore, SqliteRunStore};
 use crate::types::{Receipt, Run, RunState, Snapshot};
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct AppState {
@@ -21,6 +21,38 @@ pub struct AppState {
     pub registry: Registry,
     pub runs: SqliteRunStore,
     pub receipts: SqliteReceiptStore,
+}
+
+/// Binary mtime (unix seconds) captured when this process started. The app compares it with the
+/// binary on disk: a newer file means a rebuild happened and this process must be restarted.
+static STARTED_EXE_MTIME: OnceLock<f64> = OnceLock::new();
+
+fn exe_mtime() -> f64 {
+    std::env::current_exe()
+        .and_then(|p| std::fs::metadata(p))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+async fn version() -> Json<serde_json::Value> {
+    let started = *STARTED_EXE_MTIME.get_or_init(exe_mtime);
+    Json(serde_json::json!({
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "exe_mtime": started,
+    }))
+}
+
+/// Stop this core so the app can start a fresh one. Loopback only (the server binds 127.0.0.1).
+async fn shutdown() -> Json<serde_json::Value> {
+    tokio::spawn(async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        std::process::exit(0);
+    });
+    Json(serde_json::json!({ "stopping": true, "pid": std::process::id() }))
 }
 
 pub async fn serve(
@@ -40,8 +72,11 @@ pub async fn serve(
         .route("/receipts", get(receipts_list))
         .route("/receipts/{id}", get(receipt_get))
         .route("/kill/{pid}", post(kill_worker))
+        .route("/version", get(version))
+        .route("/shutdown", post(shutdown))
         .with_state(state);
 
+    STARTED_EXE_MTIME.get_or_init(exe_mtime);
     let listener = tokio::net::TcpListener::bind(addr).await
         .expect("failed to bind HTTP listener");
     tracing::info!("lingonberry-core HTTP on http://{}", addr);

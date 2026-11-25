@@ -7,10 +7,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Max concurrent runs per key slot (owner config `max_concurrent_per_key`, was 3 in the Python router).
+pub const MAX_INFLIGHT: usize = 3;
+
 /// A leased key with state.
 #[derive(Debug, Clone)]
 struct KeyState {
     pub name: String,
+    pub provider: String,
     pub cooling_until: f64,
     pub inflight: usize,
     pub ok: usize,
@@ -33,10 +37,11 @@ impl Registry {
         workers.sort_by(|a, b| a.id.cmp(&b.id));
 
         let mut keys = BTreeMap::new();
-        for (_, names) in &d.keys {
+        for (provider, names) in &d.keys {
             for name in names {
                 keys.insert(name.clone(), KeyState {
                     name: name.clone(),
+                    provider: provider.clone(),
                     cooling_until: 0.0,
                     inflight: 0,
                     ok: 0,
@@ -64,21 +69,48 @@ impl Registry {
         self.workers.iter().find(|w| w.id == id).cloned()
     }
 
-    /// Auto-select a worker: key-less CLIs first (no key dependency),
-    /// then key-based workers (key leased at dispatch time).
+    /// Default worker: bare `pi` (pool-leased across NIM keys), then key-less CLIs, then anything.
     pub fn select_best_worker(&self) -> Option<DiscoveredWorker> {
+        if let Some(w) = self.workers.iter().find(|w| w.agent == "pi" && w.key_slot.is_none()) {
+            return Some(w.clone());
+        }
         if let Some(w) = self.workers.iter().find(|w| w.key_slot.is_none()) {
             return Some(w.clone());
         }
         self.workers.first().cloned()
     }
 
+    /// Key for one dispatch of `w`. A pinned worker (`pi:NIM_2`) prefers its slot; the bare `pi`
+    /// worker takes whichever NIM key is free. Failover stays inside the worker's provider, so a
+    /// NIM request never leaves with a GROQ key. Waits up to 30 s for a free slot, then errors.
+    pub async fn key_for(&self, w: &DiscoveredWorker) -> Result<Option<String>, String> {
+        if w.key_slot.is_none() && w.agent != "pi" {
+            return Ok(None);
+        }
+        let prefer = w.key_slot.clone();
+        let mut last = String::new();
+        for _ in 0..30 {
+            match self.lease_key_in(prefer.as_deref(), Some(&w.provider)) {
+                Ok(k) => return Ok(Some(k)),
+                Err(e) => last = e,
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        Err(last)
+    }
+
     /// Lease a key for a worker run. Returns the key name or an error if none available.
     pub fn lease_key(&self, prefer: Option<&str>) -> Result<String, String> {
+        self.lease_key_in(prefer, None)
+    }
+
+    fn lease_key_in(&self, prefer: Option<&str>, provider: Option<&str>) -> Result<String, String> {
         let mut keys = self.keys.lock().unwrap();
         let now = now();
-        let mut candidates: Vec<&mut KeyState> = keys.values_mut().collect();
-        // Sort: preferred first, then fewest inflight, then fewest window hits, not cooling.
+        let mut candidates: Vec<&mut KeyState> = keys.values_mut()
+            .filter(|k| provider.map_or(true, |p| k.provider == p))
+            .collect();
+        // Sort: preferred first, then fewest inflight, then fewest window hits.
         candidates.sort_by(|a, b| {
             let a_pref = prefer.map_or(false, |p| a.name == p) as usize;
             let b_pref = prefer.map_or(false, |p| b.name == p) as usize;
@@ -89,17 +121,15 @@ impl Registry {
 
         for k in &mut candidates {
             if now < k.cooling_until { continue; }
-            // rpm check
             k.window.retain(|t| now - t <= 60.0);
             if k.window.len() >= self.rpm_limit { continue; }
-            // concurrency check (0 = unlimited)
-            if k.inflight >= 1 && self.rpm_limit > 0 { /* per-key concurrency handled by inflight */ }
-            // claim
+            if k.inflight >= MAX_INFLIGHT { continue; }
             k.inflight += 1;
             k.window.push(now);
             return Ok(k.name.clone());
         }
-        Err(format!("no keys available (rpm_limit={}, cooldown={}s)", self.rpm_limit, self.cooldown_s))
+        Err(format!("no free key (provider={}, max_inflight={}, rpm_limit={})",
+                    provider.unwrap_or("any"), MAX_INFLIGHT, self.rpm_limit))
     }
 
     /// Release a leased key and record outcome.
@@ -122,7 +152,7 @@ impl Registry {
             let active_calls = k.window.iter().filter(|t| now - *t <= 60.0).count();
             crate::types::WorkerStatus {
                 name: k.name.clone(),
-                status: if now < k.cooling_until { "down".to_string() } else { "idle".to_string() },
+                status: if now < k.cooling_until { "down" } else if k.inflight > 0 { "active" } else { "idle" }.to_string(),
                 calls_24h: active_calls,
                 ok_24h: k.ok,
                 key: Some(k.name.clone()),
@@ -250,5 +280,31 @@ mod tests {
         let got = store.get("r1").unwrap();
         assert_eq!(got.worker, "pi:NIM_1");
         assert_eq!(got.key_slot, Some("NIM_1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn default_is_bare_pi_and_pool_spreads_over_nim_keys_only() {
+        let reg = Registry::from_discovery(&mk_discovery());
+        assert_eq!(reg.select_best_worker().unwrap().id, "pi");
+        let pi = reg.find_worker("pi").unwrap();
+        let mut seen = std::collections::BTreeMap::<String, usize>::new();
+        // 2 NIM keys x MAX_INFLIGHT = 6 slots; the 7th must wait, and GROQ must never be leased for NIM.
+        for _ in 0..(2 * MAX_INFLIGHT) {
+            let k = reg.key_for(&pi).await.unwrap().unwrap();
+            assert_ne!(k, "GROQ_API_KEY");
+            *seen.entry(k).or_default() += 1;
+        }
+        assert_eq!(seen.get("NIM_1"), Some(&MAX_INFLIGHT));
+        assert_eq!(seen.get("NIM_2"), Some(&MAX_INFLIGHT));
+        assert!(reg.lease_key_in(None, Some("nim")).is_err());
+        reg.release_key("NIM_1", true);
+        assert_eq!(reg.lease_key_in(None, Some("nim")).unwrap(), "NIM_1");
+    }
+
+    #[tokio::test]
+    async fn pinned_worker_prefers_its_slot_but_stays_in_provider() {
+        let reg = Registry::from_discovery(&mk_discovery());
+        let pinned = reg.find_worker("pi:NIM_2").unwrap();
+        assert_eq!(reg.key_for(&pinned).await.unwrap().unwrap(), "NIM_2");
     }
 }

@@ -59,7 +59,21 @@ impl Discovery {
     pub fn workers(&self) -> Vec<DiscoveredWorker> {
         let mut out: Vec<DiscoveredWorker> = Vec::new();
 
-        // NIM workers: pi on each NIM key
+        // Bare `pi`: the default. Takes any free NIM key per dispatch (see Registry::key_for).
+        if self.keys.get("nim").map_or(false, |k| !k.is_empty()) {
+            out.push(DiscoveredWorker {
+                id: "pi".to_string(),
+                agent: "pi".to_string(),
+                key_slot: None,
+                provider: "nim".to_string(),
+                base_url: self.providers.get("nim").map(|p| p.base_url.clone()),
+                model: Some(PI_NIM_MODEL.to_string()),
+                write_access: true,
+                path: None,
+            });
+        }
+
+        // NIM workers: pi pinned to each NIM key (explicit `pi:NIM_n` only)
         for agent in &self.agents {
             if agent.id == "pi" {
                 if let Some(nim_keys) = self.keys.get("nim") {
@@ -115,7 +129,8 @@ impl Discovery {
         for agent in &self.agents {
             let id = agent.id.as_str();
             let write = matches!(id, "claude" | "codex" | "opencode" | "kilo" | "cline" | "goose" | "omp");
-            if !["pi", "nim-chat"].contains(&id) {
+            // cline runs in yolo mode and is not used as a worker: discovered, never routed to.
+            if !["pi", "nim-chat", "cline"].contains(&id) {
                 out.push(DiscoveredWorker {
                     id: id.to_string(),
                     agent: id.to_string(),
@@ -148,6 +163,9 @@ impl Discovery {
         out
     }
 }
+
+/// Model the NIM-backed pi worker asks for (same id as the Python router's config).
+pub const PI_NIM_MODEL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 
 fn scan_agents() -> Vec<Agent> {
     let bins = [
@@ -361,4 +379,34 @@ mod tests {
         let w = Worker::new("claude", None, "claude");
         assert_eq!(w.label(), "claude");
     }
+}
+
+/// Value of a key slot: process env first, then the two env files discovery already scans.
+/// Discovery sees names from those files, so the value must come from them too.
+/// The return value is never printed.
+pub fn key_value(name: &str) -> Option<String> {
+    if let Ok(v) = std::env::var(name) {
+        if !v.is_empty() {
+            return Some(v);
+        }
+    }
+    let home = std::env::var("HOME").ok()?;
+    for file in [format!("{}/.env", home), format!("{}/.config/agent-router/env", home)] {
+        let Ok(text) = std::fs::read_to_string(&file) else { continue };
+        for line in text.lines() {
+            let line = line.trim();
+            if line.starts_with('#') || !line.contains('=') {
+                continue;
+            }
+            let line = line.strip_prefix("export ").unwrap_or(line);
+            let Some((k, v)) = line.split_once('=') else { continue };
+            if k.trim() == name {
+                let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                if !v.is_empty() {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
 }
