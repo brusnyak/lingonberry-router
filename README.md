@@ -1,10 +1,9 @@
 # Lingonberry Router
 
-**One local router for every AI agent on your Mac.** Agents ask it for work; it picks a worker, leases a provider key for that worker only, runs the task, records it, and shows what is running in the menu bar.
+**One local router for every AI agent on your Mac.** Agents ask it for work; it picks a worker, leases a provider key for that worker only, runs the task, and records it.
 
 [![CI](https://github.com/brusnyak/lingonberry-router/actions/workflows/ci.yml/badge.svg)](https://github.com/brusnyak/lingonberry-router/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/core-Rust-orange)
-![Swift](https://img.shields.io/badge/ui-SwiftUI-blue)
 ![Local only](https://img.shields.io/badge/network-loopback%20only-green)
 
 [Install](#install) · [How it works](#how-it-works) · [CLI](#cli) · [HTTP API](#http-api) · [Config](#self-configuration) · [Known gaps](#known-gaps)
@@ -18,11 +17,10 @@
 | Each agent holds its own API keys | Keys stay in your env files; the router leases them |
 | One runaway agent can burn a shared quota | Per-key concurrency and calls-per-minute limits |
 | No record of who asked for what | Every run stores caller, worker, key slot, output and timing |
-| You find out a worker is busy by waiting | The menu bar shows live work and lets you stop it |
 
 ## Install
 
-Requires Rust (`cargo`) and, for the menu bar app, Xcode command-line tools.
+Requires Rust (`cargo`).
 
 ```sh
 git clone https://github.com/brusnyak/lingonberry-router.git
@@ -30,12 +28,6 @@ cd lingonberry-router/core
 cargo install --path .                 # puts lingonberry-core on PATH
 lingonberry-core init                   # writes ~/.lingonberry/config.json (doctor does not create it)
 lingonberry-core doctor                 # read-only health check, exit 1 on any failure
-```
-
-Menu bar app (optional):
-
-```sh
-cd ui && swift build -c release
 ```
 
 Provider keys go in `~/.env` or `~/.config/lingonberry/env` as `NAME=value`. The router reads the values itself; it never prints them.
@@ -49,14 +41,13 @@ flowchart LR
     R -->|dispatch| W[Worker<br/>pi · codex · claude · NIM]
     W -->|output| R
     R -->|record| D[(SQLite runs)]
-    R -->|GET /snapshot| U[Menu bar UI]
 ```
 
 1. **Discover.** `lingonberry-core discover` scans PATH for agent CLIs and env files for key *names*. Each (agent, key slot) pair becomes a worker.
 2. **Choose.** `route` prints a receipt (selected worker, alternatives, exclusions) without running anything.
 3. **Lease.** A key is leased for the worker's provider only. A NIM request never receives a GROQ key. Each key allows 3 concurrent runs and 40 calls per minute; a dispatch waits up to 30 s, then fails.
 4. **Run.** CLI agents run non-interactively with stdin closed (`claude -p`, `codex exec`, `opencode run`, `omp -p`, …; see [`core/src/agents.rs`](core/src/agents.rs)). Key-based workers call the provider's chat-completions endpoint.
-5. **Record and show.** Runs are stored with the caller found by walking parent processes. The UI polls `GET /snapshot` every 2 s.
+5. **Record.** Runs are stored with the caller found by walking parent processes.
 
 ## Quick check
 
@@ -86,7 +77,7 @@ lingonberry-core run --worker pi "say hi"                     # one real run
 
 | Method | Path | Use |
 |---|---|---|
-| GET | `/snapshot` | everything the UI shows: running workers, sessions, key slots, overview |
+| GET | `/snapshot` | running workers, sessions, key slots, overview |
 | GET | `/keys` | key-slot status |
 | GET | `/runs`, `/runs/{id}` | run history and one run |
 | GET | `/receipts`, `/receipts/{id}` | routing receipts |
@@ -108,8 +99,8 @@ core/src/agents.rs      non-interactive argv per agent CLI
 core/src/server.rs      HTTP API, snapshot, kill, version, shutdown
 core/src/storage.rs     SQLite run and receipt stores
 core/src/types.rs       shared types (Run, Worker, LiveWorker, Snapshot …)
-ui/Sources/LingonberryUI/main.swift   the menu bar app
 HANDOFF.md              current state and open decisions
+HANDOFF-AI-STUDIO.md    brief for the next build phase (Google AI Studio + Vercel site)
 ```
 
 </details>
@@ -141,7 +132,6 @@ State lives in `~/.lingonberry` (override with `$LINGONBERRY_HOME`). Every decis
 ```sh
 cd core && cargo test          # 13 unit tests
 cd core && cargo build
-cd ui && swift build           # debug
 ```
 
 CI (`.github/workflows/ci.yml`) runs the core tests and build on Linux and a gitleaks secret scan on every push and pull request.
@@ -156,4 +146,4 @@ CI (`.github/workflows/ci.yml`) runs the core tests and build on Linux and a git
 - `fanout` runs are not written to the event log yet (only `run` is).
 - Codex needs a model in `~/.codex/config.toml` that the ChatGPT login supports.
 
-Current state and open decisions: [`HANDOFF.md`](HANDOFF.md).
+Current state and open decisions: [`HANDOFF.md`](HANDOFF.md). Next build phase: [`HANDOFF-AI-STUDIO.md`](HANDOFF-AI-STUDIO.md).

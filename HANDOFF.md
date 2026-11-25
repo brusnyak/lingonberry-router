@@ -1,49 +1,26 @@
 # Handoff: Lingonberry Router
 
-Read `README.md` first. It has the layout, the API and the install steps.
+Read `README.md` first (install, CLI, API, config). For the next build phase read `HANDOFF-AI-STUDIO.md`.
 
 ## State (2026-11-25)
 
-- `main` on GitHub (`brusnyak/lingonberry-router`, private) holds the full work. `router-live-ui` is the same commit as `main`. CI: `.github/workflows/ci.yml` (core test and build, gitleaks).
-- Core: `cargo test` 13/13 (clean clone, 2026-11-25). Agent argv, provider-scoped key leasing, async `key_for`, caller walk, `/version`, `/shutdown`, env and DB paths under `~/.lingonberry`.
-- UI: menu bar popover shows running work only, the live flow, and collapsed runs that expand to the full conversation. Stop and restart act on the app and the router.
-- Installed: `/Applications/Lingonberry.app` runs the current build. Core pid and `exe_mtime` were checked against the file on disk.
-- OMP: `~/.omp/agent/extensions/router-status.ts` reads `/snapshot` (not the old Python backbone). Backup of the previous file is alongside it. This file is outside this repo.
+- `main` on GitHub holds the whole project. History was rewritten to remove personal identity and home paths; the author is now `Lingonberry dev`.
+- Scope now: the core CLI and HTTP API only. The Swift menu-bar app was removed from the repo; its installed copy was moved to the Trash.
+- Core: `cargo test` 13/13 on a fresh clone. `route` returns a receipt; `doctor` exits 0 after `init`.
+- CI: `.github/workflows/ci.yml`, core test and build on Ubuntu, gitleaks scan.
 
-## Verified
+## Open
 
-| Check | Result |
-|---|---|
-| `cargo test` (core) | 9 passed |
-| `swift build -c release` (ui) | Build complete |
-| `/version` vs file mtime | equal after install |
-| `POST /shutdown` on a test core | port closed |
-| OMP widget and `/router` against a fixture snapshot | correct lines |
-| Expanded run in the popover | prompt visible |
-
-## Not verified
-
-- Clicking Stop or Restart in the live menu bar (the code path is the same one `/shutdown` already exercised).
-- A pi run on NIM keys. It needs quota, so it was not run.
-- Narrow window width.
-
-## Open decisions (owner)
-
-1. Codex: `~/.codex/config.toml` sets `gpt-6.1-sol`, which the ChatGPT login rejects. Pick a supported model.
-2. Failover on truncated output: retry on another key, or fail as today?
-3. Planner: skip workers that doctor reports down? (Yes is the proposal.)
-4. Done 2026-11-25: Python router retired. Archived to `~/Developer/_archive/agent-router-python-2026-11-25/` (repo, state, launchd plists, `backbone` shim). Left for a later decision: the Oracle VM hub and `~/.claude/scripts/mac-node-setup.sh` (remote Python node, not touched).
-
-## Known gaps
-
-See the list in `README.md`. The top three: no retry on truncation, planner ignores doctor status, and inflight slots are not released on panic.
+1. Run-level tests for `serve` and HTTP endpoints (only unit tests exist).
+2. Planner should skip workers `doctor` marks down.
+3. Truncation retry on another key.
+4. Codex model: `~/.codex/config.toml` must name a model the ChatGPT login accepts.
 
 ## Gotchas
 
 - `run_group` gives stdin `DEVNULL`. An agent that waits for input will not hang the core, but its output may be empty.
-- The UI reads `CORE_URL` from `LINGONBERRY_CORE_URL` (default `http://127.0.0.1:8799`). Use a second port for test cores.
-- Screenshot hooks: `LINGONBERRY_SHOT=<png>`, with `LINGONBERRY_TEST_WINDOW=1` or `LINGONBERRY_TEST_POPOVER=1`. `LINGONBERRY_TEST_EXPAND=1` expands the newest run. These are test-only.
-- Do not add a `JSONDecoder.keyDecodingStrategy = .convertFromSnakeCase`. The models use explicit snake_case fields.
+- `doctor` does not create the config; run `init` first on a new machine.
+- Models use explicit snake_case fields. Do not add `keyDecodingStrategy`-style global renaming (legacy note from the Swift app; kept in case a UI is rebuilt).
 
 ## Historical
 
