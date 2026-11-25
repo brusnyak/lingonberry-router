@@ -28,6 +28,7 @@ Requires Rust (`cargo`) and, for the menu bar app, Xcode command-line tools.
 git clone https://github.com/brusnyak/lingonberry-router.git
 cd lingonberry-router/core
 cargo install --path .                 # puts lingonberry-core on PATH
+lingonberry-core init                   # writes ~/.lingonberry/config.json (doctor does not create it)
 lingonberry-core doctor                 # read-only health check, exit 1 on any failure
 ```
 
