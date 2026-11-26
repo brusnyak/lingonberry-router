@@ -67,6 +67,15 @@ impl AppState {
                 rpm: 0,
             });
         }
+        // Start next_pid above any pid already in the store so pids stay unique across
+        // restarts (the kill endpoint keys off pid via active_cancels).
+        let next_pid_start = store
+            .list_runs()
+            .iter()
+            .filter_map(|r| r.pid)
+            .max()
+            .map(|p| p + 1)
+            .unwrap_or(1);
         Self {
             config: Arc::new(Mutex::new(config)),
             discovery: Arc::new(Mutex::new(discovery)),
@@ -76,7 +85,7 @@ impl AppState {
             active_cancels: Arc::new(Mutex::new(HashMap::new())),
             active_os_pids: Arc::new(Mutex::new(HashMap::new())),
             telemetry: Arc::new(Mutex::new(telemetry)),
-            next_pid: Arc::new(AtomicU32::new(41000)),
+            next_pid: Arc::new(AtomicU32::new(next_pid_start)),
             shutdown_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -735,6 +744,7 @@ pub fn dispatch_run_async(
                     let args: Vec<&str> = match worker.agent.as_str() {
                         "claude" => vec!["-p", &cooked.cooked_prompt],
                         "codex" => vec!["exec", &cooked.cooked_prompt],
+                        "jcode" => vec!["run", &cooked.cooked_prompt],
                         "opencode" => vec!["run", &cooked.cooked_prompt],
                         "omp" => vec!["-p", &cooked.cooked_prompt],
                         _ => vec![&cooked.cooked_prompt],
@@ -1447,6 +1457,28 @@ pub async fn serve(addr: &str) -> anyhow::Result<()> {
     let disc = scan_discovery();
     let store = SqliteStore::open_default()?;
     let state = AppState::new(cfg, disc, store);
+
+    // Reconcile orphaned runs from a previous crash: mark stale Running/Leased as failed
+    // so they don't ghost the graph forever. A run stuck in Running/Leased with no live
+    // dispatch task means the core exited before finish_run was called.
+    for run in state.store.list_runs() {
+        if run.state == RunState::Running || run.state == RunState::Leased {
+            state.store.finish_run(
+                &run.id,
+                RunState::Failed,
+                None,
+                Some(false),
+                Some(
+                    "orphaned: previous core process exited before finish_run; \
+                     no live dispatch task"
+                        .to_string(),
+                ),
+                None,
+                None,
+                None,
+            );
+        }
+    }
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     *state.shutdown_tx.lock().unwrap() = Some(shutdown_tx);

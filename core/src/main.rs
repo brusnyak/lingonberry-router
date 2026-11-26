@@ -6,6 +6,7 @@ use lingonberry_core::discovery::scan_discovery;
 use lingonberry_core::registry::Registry;
 use lingonberry_core::server::{build_router, dispatch_run_async, serve, AppState};
 use lingonberry_core::storage::SqliteStore;
+use lingonberry_core::types::RunState;
 use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 
@@ -172,7 +173,27 @@ async fn main() -> Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             }
             let final_run = state.store.get_run(&run.id).unwrap_or(run);
-            println!("{}", serde_json::to_string_pretty(&final_run)?);
+            // Print copy text on success so `lingonberry-core run` returns the actual output,
+            // not a dispatch receipt JSON. On failure, surface the error.
+            match final_run.state {
+                RunState::Done => {
+                    if let Some(output) = &final_run.output {
+                        print!("{output}");
+                    } else {
+                        println!("{}", serde_json::to_string_pretty(&final_run)?);
+                    }
+                }
+                RunState::Failed | RunState::Escalated | RunState::Blocked => {
+                    eprintln!(
+                        "{}",
+                        final_run.error.unwrap_or_else(|| "run failed".to_string())
+                    );
+                    std::process::exit(1);
+                }
+                _ => {
+                    println!("{}", serde_json::to_string_pretty(&final_run)?);
+                }
+            }
         }
         Commands::Fanout {
             prompts,

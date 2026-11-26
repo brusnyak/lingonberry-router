@@ -12,7 +12,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "LingonberryBar",
-            path: "Sources/LingonberryBar"
+            path: "Sources/LingonberryBar",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+            ]
         )
     ]
 )

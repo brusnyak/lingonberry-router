@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Lingonberry leaf background -->
+  <defs>
+    <linearGradient id="leafGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#22c55e;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#15803d;stop-opacity:1" />
+    </linearGradient>
+    <linearGradient id="routeGrad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#f59e0b;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#d97706;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square container -->
+  <rect width="1024" height="1024" rx="220" fill="#090a0d"/>
+
+  <!-- Lingonberry leaf shape (simplified berry cluster) -->
+  <ellipse cx="340" cy="340" rx="110" ry="140" fill="url(#leafGrad)" transform="rotate(-30 340 340)"/>
+  <ellipse cx="684" cy="340" rx="110" ry="140" fill="url(#leafGrad)" transform="rotate(30 684 340)"/>
+  <ellipse cx="512" cy="540" rx="130" ry="160" fill="url(#leafGrad)"/>
+
+  <!-- Router dispatch node in center -->
+  <circle cx="512" cy="512" r="90" fill="url(#routeGrad)"/>
+  <circle cx="512" cy="512" r="90" fill="none" stroke="#ffffff" stroke-width="3" opacity="0.3"/>
+
+  <!-- Routing lines emanating from center -->
+  <path d="M 512 422 L 512 340" stroke="#ffffff" stroke-width="6" stroke-linecap="round" opacity="0.6"/>
+  <path d="M 512 602 L 512 684" stroke="#ffffff" stroke-width="6" stroke-linecap="round" opacity="0.6"/>
+  <path d="M 422 512 L 340 512" stroke="#ffffff" stroke-width="6" stroke-linecap="round" opacity="0.6"/>
+  <path d="M 602 512 L 684 512" stroke="#ffffff" stroke-width="6" stroke-linecap="round" opacity="0.6"/>
+
+  <!-- Small dispatch dots -->
+  <circle cx="512" cy="380" r="14" fill="#ffffff" opacity="0.8"/>
+  <circle cx="512" cy="644" r="14" fill="#ffffff" opacity="0.8"/>
+  <circle cx="470" cy="512" r="14" fill="#ffffff" opacity="0.8"/>
+  <circle cx="554" cy="512" r="14" fill="#ffffff" opacity="0.8"/>
+</svg>
