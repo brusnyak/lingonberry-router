@@ -32,7 +32,7 @@ enum Commands {
         prompt: String,
         #[arg(long, default_value = "plan")]
         phase: String,
-        #[arg(long)]
+        #[arg(long, env = "ROUTER_CALLER")]
         caller: Option<String>,
         #[arg(long)]
         worktree: bool,
@@ -42,7 +42,7 @@ enum Commands {
         prompt: String,
         #[arg(long)]
         worker: Option<String>,
-        #[arg(long)]
+        #[arg(long, env = "ROUTER_CALLER")]
         caller: Option<String>,
         #[arg(long)]
         worktree: bool,
@@ -52,7 +52,7 @@ enum Commands {
     /// Dispatch multiple prompts in parallel across workers
     Fanout {
         prompts: Vec<String>,
-        #[arg(long)]
+        #[arg(long, env = "ROUTER_CALLER")]
         caller: Option<String>,
         #[arg(long)]
         worktree: bool,
@@ -73,6 +73,7 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    lingonberry_core::discovery::ensure_tool_path();
     let cli = Cli::parse();
     match cli.command {
         Commands::Init { force } => {
@@ -156,12 +157,17 @@ async fn main() -> Result<()> {
                 None,
                 live_api,
                 None,
+                true,
             );
+            // Wait until the spawned dispatch writes a terminal state. A missing row means "not finished yet":
+            // the old check returned immediately, and the CLI exited before the model call completed.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
             while state
                 .store
                 .get_run(&run.id)
                 .map(|r| r.state == lingonberry_core::types::RunState::Running)
-                .unwrap_or(false)
+                .unwrap_or(true)
+                && std::time::Instant::now() < deadline
             {
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             }
@@ -192,6 +198,7 @@ async fn main() -> Result<()> {
                     None,
                     false,
                     Some(group.clone()),
+                    true,
                 );
                 ids.push(r.id);
             }
@@ -260,12 +267,12 @@ async fn main() -> Result<()> {
                             },
                             {
                                 "name": "lingonberry_discover",
-                                "description": "List discovered CLI agents, provider key slot names (never values), and skill directories",
+                                "description": "List discovered CLI agents, provider key names (never values), and skill directories",
                                 "inputSchema": { "type": "object", "properties": {} }
                             },
                             {
                                 "name": "lingonberry_snapshot",
-                                "description": "Return current router snapshot: live workers, key slots, host cron jobs, and sessions",
+                                "description": "Return current router snapshot: live workers, keys, host cron jobs, and sessions",
                                 "inputSchema": { "type": "object", "properties": {} }
                             },
                             {

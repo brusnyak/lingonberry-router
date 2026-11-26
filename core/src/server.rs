@@ -1,6 +1,6 @@
 use crate::agents::{
-    apply_self_config_targets, build_self_config_plan, call_provider_api, cook_prompt,
-    is_output_truncated, route_prompt,
+    apply_self_config_targets, build_self_config_plan, call_chunked, call_provider_api, cook_prompt,
+    is_output_truncated, route_prompt_with,
 };
 use crate::config::{load_config, Config};
 use crate::cron::{execute_os_cron_command, kill_os_pid};
@@ -95,7 +95,7 @@ impl AppState {
                 pid: r.pid.unwrap_or(0),
                 worker: r.worker.clone(),
                 caller: r.caller.clone(),
-                key: r.key_slot.clone(),
+                key: r.key_name.clone(),
                 model: r.model.clone(),
                 provider: r.provider.clone(),
                 run_id: Some(r.id.clone()),
@@ -130,12 +130,13 @@ impl AppState {
                 prompt: r.prompt,
                 worker: r.worker,
                 caller: r.caller,
-                key: r.key_slot,
+                key: r.key_name,
                 state: r.state.as_str().to_string(),
                 duration_s: r.elapsed_ms.unwrap_or(0) as f64 / 1000.0,
                 reason: r.error,
                 output: r.output,
                 receipt_id: r.receipt_id,
+                cooked: r.cooked,
                 steps: r.steps,
                 fanout_group: r.fanout_group,
                 failover_from: r.failover_from,
@@ -172,10 +173,36 @@ impl AppState {
     }
 }
 
+/// One long-lived sampler. CPU usage needs two samples, and building a new `System` for every
+/// poll scanned every process on the machine several times a minute.
+static SAMPLER: std::sync::OnceLock<std::sync::Mutex<System>> = std::sync::OnceLock::new();
+
 pub fn collect_system_info() -> SystemInfo {
-    let mut sys = System::new_all();
+    let cell = SAMPLER.get_or_init(|| std::sync::Mutex::new(System::new()));
+    let mut sys = cell.lock().unwrap_or_else(|e| e.into_inner());
     sys.refresh_cpu_usage();
     sys.refresh_memory();
+
+    // The app's own footprint: this core plus its parent when that parent is the tray.
+    let me = sysinfo::Pid::from_u32(std::process::id());
+    let kind = sysinfo::ProcessRefreshKind::new().with_cpu().with_memory();
+    sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[me]), true, kind);
+    let parent = sys.process(me).and_then(|p| p.parent());
+    let mut pids = vec![me];
+    if let Some(pp) = parent {
+        sys.refresh_processes_specifics(sysinfo::ProcessesToUpdate::Some(&[pp]), true, kind);
+        let is_tray = sys
+            .process(pp)
+            .map(|p| p.name().to_string_lossy().contains("lingonberry-tray"))
+            .unwrap_or(false);
+        if is_tray {
+            pids.push(pp);
+        }
+    }
+    let app_cpu: f32 = pids.iter().filter_map(|p| sys.process(*p)).map(|p| p.cpu_usage()).sum();
+    let app_ram: u64 = pids.iter().filter_map(|p| sys.process(*p)).map(|p| p.memory()).sum();
+    let app_ram_gb = Some((app_ram as f64 / 1_073_741_824.0 * 100.0).round() / 100.0);
+    let app_cpu_pct = Some(app_cpu as f64);
 
     let cpu_pct = if sys.cpus().is_empty() {
         None
@@ -208,6 +235,8 @@ pub fn collect_system_info() -> SystemInfo {
         ram_total_gb,
         disk_used_gb,
         disk_total_gb,
+        app_cpu_pct,
+        app_ram_gb,
     }
 }
 
@@ -276,15 +305,18 @@ pub fn dispatch_run_async(
     simulate_fault: Option<String>,
     live_api: bool,
     fanout_group: Option<String>,
+    allow_keys: bool,
 ) -> Run {
+    let live_api = live_api && allow_keys;
     let discovery = state.discovery.lock().unwrap().clone();
-    let receipt = route_prompt(
+    let receipt = route_prompt_with(
         &prompt,
         &phase,
         caller.as_deref(),
         &discovery,
         &state.registry,
         use_worktree,
+        allow_keys,
     );
     let _ = state.store.insert_receipt(&receipt);
 
@@ -328,7 +360,7 @@ pub fn dispatch_run_async(
             created_at: Utc::now().to_rfc3339(),
             worker: worker_id.unwrap_or_else(|| "unassigned".into()),
             caller,
-            key_slot: None,
+            key_name: None,
             model: None,
             provider: None,
             prompt,
@@ -352,10 +384,10 @@ pub fn dispatch_run_async(
         return failed;
     };
 
-    let guard = if worker.key_slot.is_some() || worker.agent == "pi" {
+    let guard = if worker.key_name.is_some() || worker.agent == "pi" {
         match state
             .registry
-            .lease_guard(worker.key_slot.as_deref(), Some(&worker.provider))
+            .lease_guard(worker.key_name.as_deref(), Some(&worker.provider))
         {
             Ok(g) => Some(g),
             Err(e) => {
@@ -364,7 +396,7 @@ pub fn dispatch_run_async(
                     created_at: Utc::now().to_rfc3339(),
                     worker: worker.id.clone(),
                     caller,
-                    key_slot: worker.key_slot.clone(),
+                    key_name: worker.key_name.clone(),
                     model: worker.model.clone(),
                     provider: Some(worker.provider.clone()),
                     prompt,
@@ -392,7 +424,7 @@ pub fn dispatch_run_async(
         None
     };
 
-    let key_slot = guard.as_ref().map(|g| g.key_name().to_string());
+    let key_name = guard.as_ref().map(|g| g.key_name().to_string());
     let mut full_steps = steps;
     full_steps.push(SessionStep {
         ts: now + 0.25,
@@ -409,9 +441,9 @@ pub fn dispatch_run_async(
         ts: now + 0.4,
         stage: "leased".into(),
         title: "Dispatching task…".into(),
-        detail: key_slot
+        detail: key_name
             .as_ref()
-            .map(|k| format!("Leased key slot {k} ({})", worker.provider))
+            .map(|k| format!("Leased key {k} ({})", worker.provider))
             .unwrap_or_else(|| format!("Local CLI ({})", worker.agent)),
         tone: "active".into(),
     });
@@ -423,7 +455,7 @@ pub fn dispatch_run_async(
         created_at: Utc::now().to_rfc3339(),
         worker: worker.id.clone(),
         caller: caller.clone(),
-        key_slot: key_slot.clone(),
+        key_name: key_name.clone(),
         model: worker.model.clone(),
         provider: Some(worker.provider.clone()),
         prompt,
@@ -453,7 +485,7 @@ pub fn dispatch_run_async(
         serde_json::json!({
             "run_id": run.id,
             "worker": run.worker,
-            "key_slot": run.key_slot,
+            "key_name": run.key_name,
             "fanout_group": run.fanout_group,
         }),
     );
@@ -467,7 +499,7 @@ pub fn dispatch_run_async(
         let work = async {
             if fault == "429" || fault == "truncated" {
                 tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
-                let failed_slot = key_slot.clone();
+                let failed_slot = key_name.clone();
                 if let Some(g) = guard {
                     g.complete(false, Some(20));
                 }
@@ -481,7 +513,7 @@ pub fn dispatch_run_async(
                 {
                     if let Ok(fb_guard) = state
                         .registry
-                        .lease_guard(fallback.key_slot.as_deref(), Some(&fallback.provider))
+                        .lease_guard(fallback.key_name.as_deref(), Some(&fallback.provider))
                     {
                         let fb_key = fb_guard.key_name().to_string();
                         state.store.append_step(
@@ -535,7 +567,7 @@ pub fn dispatch_run_async(
                     RunState::Escalated,
                     Some(1100),
                     Some(false),
-                    Some(format!("{fault} fault detected; no sibling slot free")),
+                    Some(format!("{fault} fault detected; no other key free")),
                     None,
                     None,
                     None,
@@ -545,39 +577,53 @@ pub fn dispatch_run_async(
 
             if live_api {
                 if let (Some(base_url), Some(slot), Some(model)) =
-                    (worker.base_url.as_deref(), key_slot.as_deref(), worker.model.as_deref())
+                    (worker.base_url.as_deref(), key_name.as_deref(), worker.model.as_deref())
                 {
-                    match call_provider_api(base_url, slot, model, &cooked.cooked_prompt).await {
+                    let started = std::time::Instant::now();
+                    match call_chunked(base_url, slot, model, &cooked).await {
                         Ok((text, finish_reason))
-                            if !is_output_truncated(&text, finish_reason.as_deref()) =>
+                            if !text.trim().is_empty()
+                                && !is_output_truncated(&text, finish_reason.as_deref()) =>
                         {
+                            let elapsed_ms = started.elapsed().as_millis() as u64;
                             if let Some(g) = guard {
                                 g.complete(true, None);
                             }
+                            let chars_in = cooked.cooked_prompt.chars().count() as u64;
+                            let chars_out = text.chars().count() as u64;
                             state.store.append_step(
                                 &run_id,
                                 SessionStep {
                                     ts: now_sec(),
                                     stage: "gate".into(),
                                     title: "Live provider verified".into(),
-                                    detail: format!("Gate {} passed", cooked.gate_policy),
+                                    detail: format!(
+                                        "{} call on {} in {} ms",
+                                        worker.provider,
+                                        worker.id,
+                                        elapsed_ms
+                                    ),
                                     tone: "done".into(),
                                 },
                             );
                             state.store.finish_run(
                                 &run_id,
                                 RunState::Done,
-                                Some(1800),
+                                Some(elapsed_ms),
                                 Some(true),
                                 None,
                                 Some(text),
-                                Some(640),
-                                Some(320),
+                                Some(chars_in / 4),
+                                Some(chars_out / 4),
                             );
                             return;
                         }
-                        Ok(_) | Err(_) => {
-                            let failed_reason = "Truncated or rate-limited provider response";
+                        other => {
+                            // Surface the real cause (HTTP status + body snippet, or the transport error).
+                            let failed_reason = match other {
+                                Err(e) => redact_secrets(&format!("{e:#}")),
+                                _ => "Truncated or empty provider response".to_string(),
+                            };
                             if let Some(g) = guard {
                                 g.complete(false, Some(20));
                             }
@@ -595,7 +641,7 @@ pub fn dispatch_run_async(
                                     fallback.base_url.as_deref(),
                                     fallback.model.as_deref(),
                                     state.registry.lease_guard(
-                                        fallback.key_slot.as_deref(),
+                                        fallback.key_name.as_deref(),
                                         Some(&fallback.provider),
                                     ),
                                 ) {
@@ -621,6 +667,7 @@ pub fn dispatch_run_async(
                                         fallback.model.clone(),
                                         Some(slot.to_string()),
                                     );
+                                    let fb_started = std::time::Instant::now();
                                     if let Ok((retry_text, retry_finish)) = call_provider_api(
                                         fb_base,
                                         &fb_key,
@@ -629,11 +676,14 @@ pub fn dispatch_run_async(
                                     )
                                     .await
                                     {
+                                        let fb_elapsed_ms = fb_started.elapsed().as_millis() as u64;
                                         if !is_output_truncated(
                                             &retry_text,
                                             retry_finish.as_deref(),
                                         ) {
                                             fb_guard.complete(true, None);
+                                            let fb_chars_in = cooked.cooked_prompt.chars().count() as u64;
+                                            let fb_chars_out = retry_text.chars().count() as u64;
                                             state.store.append_step(
                                                 &run_id,
                                                 SessionStep {
@@ -641,8 +691,9 @@ pub fn dispatch_run_async(
                                                     stage: "gate".into(),
                                                     title: "Live failover verified".into(),
                                                     detail: format!(
-                                                        "Recovered on {} ({fb_key})",
-                                                        fallback.id
+                                                        "Recovered on {} ({fb_key}) in {} ms",
+                                                        fallback.id,
+                                                        fb_elapsed_ms
                                                     ),
                                                     tone: "done".into(),
                                                 },
@@ -650,12 +701,12 @@ pub fn dispatch_run_async(
                                             state.store.finish_run(
                                                 &run_id,
                                                 RunState::Done,
-                                                Some(2600),
+                                                Some(fb_elapsed_ms),
                                                 Some(true),
                                                 None,
                                                 Some(retry_text),
-                                                Some(720),
-                                                Some(360),
+                                                Some(fb_chars_in / 4),
+                                                Some(fb_chars_out / 4),
                                             );
                                             return;
                                         }
@@ -680,7 +731,7 @@ pub fn dispatch_run_async(
             }
 
             if let Some(ref bin_path) = worker.path {
-                if worker.key_slot.is_none() && std::path::Path::new(bin_path).exists() {
+                if worker.key_name.is_none() && std::path::Path::new(bin_path).exists() {
                     let args: Vec<&str> = match worker.agent.as_str() {
                         "claude" => vec!["-p", &cooked.cooked_prompt],
                         "codex" => vec!["exec", &cooked.cooked_prompt],
@@ -763,6 +814,58 @@ pub fn dispatch_run_async(
                 }
             }
 
+            // Direct provider-API worker (a keyed slot such as pi:NIM_1): call the provider
+            // and measure real elapsed/tokens instead of the fixed stub. Falls through to the
+            // generic stub below for any worker that is neither a CLI spawn nor a keyed provider.
+            if worker.key_name.is_some()
+                && worker.base_url.is_some()
+                && worker.model.is_some()
+            {
+                let started = std::time::Instant::now();
+                let base = worker.base_url.as_deref().unwrap();
+                let key = worker.key_name.as_deref().unwrap();
+                let model = worker.model.as_deref().unwrap();
+                let live_result = call_chunked(base, key, model, &cooked).await;
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if let Ok((text, finish_reason)) = live_result {
+                    if !text.trim().is_empty() && !is_output_truncated(&text, finish_reason.as_deref()) {
+                        if let Some(g) = guard {
+                            g.complete(true, None);
+                        }
+                        let chars_in = cooked.cooked_prompt.chars().count() as u64;
+                        let chars_out = text.chars().count() as u64;
+                        state.store.append_step(
+                            &run_id,
+                            SessionStep {
+                                ts: now_sec(),
+                                stage: "gate".into(),
+                                title: "Live provider verified".into(),
+                                detail: format!(
+                                    "{} call on {} in {} ms",
+                                    worker.provider,
+                                    worker.id,
+                                    elapsed_ms
+                                ),
+                                tone: "done".into(),
+                            },
+                        );
+                        state.store.finish_run(
+                            &run_id,
+                            RunState::Done,
+                            Some(elapsed_ms),
+                            Some(true),
+                            None,
+                            Some(text),
+                            Some(chars_in / 4),
+                            Some(chars_out / 4),
+                        );
+                        return;
+                    }
+                }
+                // Provider call failed or returned empty/truncated: fall to the generic stub below
+                // so the run is still recorded rather than lost. The guard will be released by the stub.
+            }
+
             tokio::time::sleep(std::time::Duration::from_millis(2400)).await;
             if let Some(g) = guard {
                 g.complete(true, None);
@@ -819,9 +922,14 @@ pub fn dispatch_run_async(
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let cors = tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::predicate(owner_origin_value))
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any);
     Router::new()
         .route("/snapshot", get(get_snapshot))
         .route("/api/snapshot", get(get_snapshot))
+        .route("/api/capabilities", get(get_capabilities))
         .route("/keys", get(get_keys))
         .route("/api/keys", get(get_keys))
         .route("/keys/:name/reset", post(post_key_reset))
@@ -857,6 +965,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/:name", delete(delete_job))
         .route("/api/self-config", get(get_self_config))
         .route("/api/self-config/apply", post(post_self_config_apply))
+        .layer(axum::middleware::from_fn(guard))
+        .layer(cors)
         .with_state(state)
 }
 
@@ -880,6 +990,75 @@ async fn get_run_by_id(
         Some(r) => Json(r).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+/// What the UI may show about this machine. Key names only, never values.
+async fn get_capabilities(State(state): State<AppState>) -> impl IntoResponse {
+    let disc = state.discovery.lock().unwrap().clone();
+    let providers: Vec<String> = disc.keys.keys().cloned().collect();
+    Json(serde_json::json!({
+        "live_google_available": disc.keys.contains_key("google"),
+        "discovered_providers": providers,
+        "rust_core_present": true,
+        "runtime": "rust-core",
+    }))
+}
+
+/// The tray app's own webview. Only this origin may change state or spend the owner's keys over HTTP.
+pub fn is_owner_origin_str(o: &str) -> bool {
+    o == "tauri://localhost" || o == "http://tauri.localhost"
+}
+
+fn owner_origin_value(origin: &axum::http::HeaderValue, _: &axum::http::request::Parts) -> bool {
+    origin.to_str().map(is_owner_origin_str).unwrap_or(false)
+}
+
+pub fn is_owner_request(headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(is_owner_origin_str)
+        .unwrap_or(false)
+}
+
+/// Host and Origin guard. Blocks DNS rebinding (Host must be loopback), blocks state changes from
+/// any browser origin except the owner's app, and keeps spend routes off browser origins entirely.
+async fn guard(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, Method};
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    // empty Host: in-process requests only; every real HTTP/1.1 client sends one
+    let host_ok = host.is_empty()
+        || host == "127.0.0.1"
+        || host.starts_with("127.0.0.1:")
+        || host == "localhost"
+        || host.starts_with("localhost:");
+    if !host_ok {
+        return (StatusCode::FORBIDDEN, "host not allowed").into_response();
+    }
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let owner = origin.as_deref().map(is_owner_origin_str).unwrap_or(false);
+    let path = req.uri().path().to_string();
+    let spend_route = matches!(path.as_str(), "/api/run" | "/api/route" | "/api/fanout");
+    let mutating = matches!(*req.method(), Method::POST | Method::PUT | Method::DELETE);
+    if mutating && origin.is_some() && !owner && !spend_route {
+        return (StatusCode::FORBIDDEN, "state changes are owner-only").into_response();
+    }
+    if spend_route && origin.is_some() && !owner {
+        // browser pages may not trigger agent runs; CLI and curl callers (no Origin) may, without keys
+        return (StatusCode::FORBIDDEN, "agent runs are not available to browser origins").into_response();
+    }
+    next.run(req).await
 }
 
 async fn get_discover(State(state): State<AppState>) -> impl IntoResponse {
@@ -983,22 +1162,28 @@ async fn post_rescan(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn post_route(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RouteBody>,
 ) -> impl IntoResponse {
     let disc = state.discovery.lock().unwrap().clone();
-    let receipt = route_prompt(
+    let receipt = route_prompt_with(
         &body.prompt,
         body.phase.as_deref().unwrap_or("plan"),
         body.caller.as_deref(),
         &disc,
         &state.registry,
         body.worktree.unwrap_or(false),
+        is_owner_request(&headers),
     );
     let _ = state.store.insert_receipt(&receipt);
     Json(receipt)
 }
 
-async fn post_run(State(state): State<AppState>, Json(body): Json<RunBody>) -> impl IntoResponse {
+async fn post_run(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<RunBody>,
+) -> impl IntoResponse {
     let run = dispatch_run_async(
         state.clone(),
         body.prompt,
@@ -1009,14 +1194,17 @@ async fn post_run(State(state): State<AppState>, Json(body): Json<RunBody>) -> i
         body.simulate_fault,
         body.live_api.unwrap_or(false),
         None,
+        is_owner_request(&headers),
     );
     Json(serde_json::json!({ "run": run, "snapshot": state.build_snapshot() }))
 }
 
 async fn post_fanout(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<FanoutBody>,
 ) -> impl IntoResponse {
+    let owner = is_owner_request(&headers);
     let prompts: Vec<String> = match (body.prompts, body.prompt) {
         (Some(list), _) if !list.is_empty() => list,
         (_, Some(base)) if !base.trim().is_empty() => vec![
@@ -1045,6 +1233,7 @@ async fn post_fanout(
             None,
             false,
             Some(group.clone()),
+            owner,
         ));
     }
     Json(serde_json::json!({
@@ -1082,6 +1271,10 @@ async fn post_job(
     State(state): State<AppState>,
     Json(body): Json<JobCreateBody>,
 ) -> impl IntoResponse {
+    if body.command.is_some() {
+        // shell commands are not accepted over HTTP; jobs run the router's own prompt runner
+        return (StatusCode::FORBIDDEN, "custom job commands are not accepted over HTTP").into_response();
+    }
     let every = body.every_s.unwrap_or(300).max(30);
     let cmd = body
         .command
@@ -1105,7 +1298,7 @@ async fn post_job(
         last_error: None,
         log_tail: vec!["Scheduled with watchdog monitoring".into()],
     });
-    Json(state.store.list_jobs())
+    Json(state.store.list_jobs()).into_response()
 }
 
 async fn post_job_toggle(
@@ -1198,6 +1391,7 @@ async fn post_job_run(
         None,
         false,
         None,
+        true,
     );
     Json(serde_json::json!({
         "jobs": state.store.list_jobs(),
@@ -1291,6 +1485,7 @@ pub async fn serve(addr: &str) -> anyhow::Result<()> {
                         None,
                         false,
                         None,
+                        true,
                     );
                 }
             }
@@ -1351,6 +1546,7 @@ mod tests {
             ssh_hosts: vec![],
             git_projects: vec![],
             browsers: vec![],
+            stores: vec![],
         };
         AppState::new(Config::default(), disc, store)
     }
@@ -1370,6 +1566,59 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(jobs.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn rebinding_host_is_refused() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/snapshot")
+                    .header("host", "evil.example:8799")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn browser_origin_cannot_change_state_or_run_agents() {
+        for path in ["/kill/1", "/api/jobs", "/api/run"] {
+            let app = build_router(test_state());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header("origin", "https://evil.example")
+                        .header("content-type", "application/json")
+                        .body(Body::from("{}"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "path {path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_origin_is_the_only_state_changer() {
+        let app = build_router(test_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/kill/999999")
+                    .header("origin", "tauri://localhost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -1400,6 +1649,7 @@ mod tests {
             ssh_hosts: vec![],
             git_projects: vec![],
             browsers: vec![],
+            stores: vec![],
         };
         let state = AppState::new(Config::default(), disc, SqliteStore::open_in_memory().unwrap());
         let app = build_router(state.clone());

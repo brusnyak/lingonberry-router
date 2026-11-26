@@ -35,7 +35,7 @@ pub struct RegistryInner {
     pub default_worker: String,
 }
 
-/// Thread-safe worker & key-slot registry with RAII LeaseGuard.
+/// Thread-safe worker & key registry with RAII LeaseGuard.
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<RegistryInner>>,
@@ -102,7 +102,7 @@ impl Registry {
                 keys,
                 down_workers: BTreeSet::new(),
                 rpm_limit: cfg.rpm_per_key,
-                provider_rpm_caps: BTreeMap::new(),
+                provider_rpm_caps: cfg.provider_rpm.clone(),
                 cooldown_s: cfg.cooldown_s,
                 max_inflight: cfg.max_inflight_per_key,
                 default_worker: cfg.default_worker.clone(),
@@ -120,6 +120,9 @@ impl Registry {
         workers.sort_by(|a, b| a.id.cmp(&b.id));
         guard.workers = workers;
         guard.rpm_limit = cfg.rpm_per_key;
+        for (prov, rpm) in &cfg.provider_rpm {
+            guard.provider_rpm_caps.entry(prov.clone()).or_insert(*rpm);
+        }
         guard.cooldown_s = cfg.cooldown_s;
         guard.max_inflight = cfg.max_inflight_per_key;
         guard.default_worker = cfg.default_worker.clone();
@@ -193,14 +196,14 @@ impl Registry {
         available
             .iter()
             .find(|w| {
-                w.id == guard.default_worker && (w.key_slot.is_none() || w.agent == "pi")
+                w.id == guard.default_worker && (w.key_name.is_none() || w.agent == "pi")
             })
             .or_else(|| {
                 available
                     .iter()
-                    .find(|w| w.agent == "pi" && w.key_slot.is_none())
+                    .find(|w| w.agent == "pi" && w.key_name.is_none())
             })
-            .or_else(|| available.iter().find(|w| w.key_slot.is_none()))
+            .or_else(|| available.iter().find(|w| w.key_name.is_none()))
             .or_else(|| available.first())
             .map(|w| (*w).clone())
     }
@@ -219,7 +222,7 @@ impl Registry {
                 if guard.down_workers.contains(&w.id) {
                     return false;
                 }
-                let Some(slot) = &w.key_slot else {
+                let Some(slot) = &w.key_name else {
                     return false;
                 };
                 if exclude_keys.contains(slot) {
@@ -398,6 +401,7 @@ mod tests {
             ssh_hosts: vec![],
             git_projects: vec![],
             browsers: vec![],
+            stores: vec![],
         }
     }
 

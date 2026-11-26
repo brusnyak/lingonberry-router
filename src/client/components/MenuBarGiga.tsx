@@ -1,949 +1,442 @@
 import React, { useMemo, useState } from 'react';
-import {
-  ChevronDown,
-  ChevronRight,
-  GitFork,
-  RefreshCw,
-  RotateCcw,
-  Square,
-} from 'lucide-react';
 import type { RouterRuntimeState } from '../lib/routerClient';
-import { OrchestrationGraph } from './OrchestrationGraph';
+import type { SessionRow, SessionStep, WorkerStatus } from '../../types';
 
-type SessionFilter = 'all' | 'active' | 'blocked' | 'done';
+/*
+ * Menu bar (Giga reference layout). Idle by default: with nothing running the graph shows only the
+ * router. Callers, workers and gates appear when work is running. Live data throughout.
+ */
 
 interface MenuBarGigaProps {
   state: RouterRuntimeState;
   busy: boolean;
   onRefresh: () => Promise<void> | void;
-  onRoute: (params: { prompt: string; caller: string; worktree: boolean }) => Promise<void> | void;
-  onRun: (params: {
-    prompt: string;
-    caller: string;
-    worktree: boolean;
-    simulate_fault: 'none' | '429' | 'truncated';
-    live_api: boolean;
-  }) => Promise<void> | void;
-  onFanout: (params: { prompt: string; caller: string; worktree: boolean }) => Promise<void> | void;
   onKillWorker: (pid: number) => Promise<void> | void;
-  onResetKey: (name: string) => Promise<void> | void;
   onAdjustProviderRpm: (provider: string, nextRpm: number) => Promise<void> | void;
-  onToggleJob: (name: string) => Promise<void> | void;
-  onRunJob: (name: string) => Promise<void> | void;
-  onHealJob: (name: string) => Promise<void> | void;
-  onOpenCronTab: () => void;
+  onToggleJob?: (name: string) => Promise<void> | void;
+  onRunJob?: (name: string) => Promise<void> | void;
+  onHealJob?: (name: string) => Promise<void> | void;
+  onRoute?: (p: never) => unknown;
+  onRun?: (p: never) => unknown;
+  onFanout?: (p: never) => unknown;
+  onResetKey?: (p: never) => unknown;
+  onOpenCronTab?: () => void;
   onOpenAgentsTab?: () => void;
 }
 
-function formatElapsed(seconds: number): string {
-  if (seconds < 60) return `${seconds.toFixed(0)}s`;
-  const m = Math.floor(seconds / 60);
-  const s = Math.round(seconds % 60);
-  return `${m}m ${s}s`;
+const isRunning = (s: SessionRow) => s.state === 'running' || s.state === 'leased';
+const isBlocked = (s: SessionRow) => ['blocked', 'escalated', 'failed'].includes(s.state);
+
+function clock(ts: number): string {
+  const d = new Date(ts * 1000);
+  return Number.isNaN(d.getTime()) ? '--:--' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+}
+function ago(ts: number): string {
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return `${Math.round(s)}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  return `${Math.round(s / 3600)}h ago`;
+}
+function dur(sec: number): string {
+  if (sec < 60) return `${sec.toFixed(0)}s`;
+  return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`;
 }
 
-function formatTimeOfDay(tsSeconds: number): string {
-  const d = new Date(tsSeconds * 1000);
-  if (Number.isNaN(d.getTime())) return '--:--';
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+async function copyText(text: string) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    /* clipboard may be unavailable in a webview; the text stays selectable */
+  }
 }
 
 export const MenuBarGiga: React.FC<MenuBarGigaProps> = ({
   state,
   busy,
   onRefresh,
-  onRoute,
-  onRun,
-  onFanout,
   onKillWorker,
-  onResetKey,
   onAdjustProviderRpm,
   onToggleJob,
   onRunJob,
-  onHealJob,
-  onOpenCronTab,
-  onOpenAgentsTab,
 }) => {
   const snap = state.snapshot;
-  const [caller, setCaller] = useState('claude');
-  const [prompt, setPrompt] = useState(
-    'audit auth middleware for cookie drops and verify with tests'
-  );
-  const [worktree, setWorktree] = useState(true);
-  const [fault, setFault] = useState<'none' | '429' | 'truncated'>('none');
-  const [useLiveGemini, setUseLiveGemini] = useState(false);
+  const [filter, setFilter] = useState<'all' | 'active' | 'blocked' | 'done'>('all');
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [showAll, setShowAll] = useState(false);
 
-  const [sessionFilter, setSessionFilter] = useState<SessionFilter>('all');
-  const [expandedSessionId, setExpandedSessionId] = useState<string | null>(
-    snap.sessions[0]?.id ?? null
-  );
-  const [showAllSessions, setShowAllSessions] = useState(false);
-  const [unmounted, setUnmounted] = useState(false);
+  const running = useMemo(() => snap.sessions.filter(isRunning), [snap.sessions]);
+  const blocked = useMemo(() => snap.sessions.filter(isBlocked), [snap.sessions]);
+  const done = useMemo(() => snap.sessions.filter((s) => s.state === 'done'), [snap.sessions]);
+  const finished = snap.overview.completed_24h + snap.overview.failed_24h;
+  const successPct = finished === 0 ? null : (snap.overview.completed_24h / finished) * 100;
+  const hasActive = running.length > 0 || snap.workers_live.length > 0;
 
-  const stats = useMemo(() => {
-    const passed = snap.overview.completed_24h;
-    const blocked = snap.sessions.filter(
-      (s) => s.state === 'blocked' || s.state === 'escalated'
-    ).length;
-    const failed = snap.overview.failed_24h;
-    const total = Math.max(1, passed + blocked + failed);
-    const successPct = ((passed / total) * 100).toFixed(1);
-    const healthyKeys = snap.workers.filter((w) => w.status !== 'down').length;
-    return { passed, blocked, failed, total, successPct, healthyKeys };
-  }, [snap]);
+  const visibleSessions = useMemo(() => {
+    const list =
+      filter === 'active' ? running : filter === 'blocked' ? blocked : filter === 'done' ? done : snap.sessions;
+    return showAll ? list : list.slice(0, 8);
+  }, [filter, snap.sessions, running, blocked, done, showAll]);
 
-  // Group key slots by provider for the Providers column
-  const providerGroups = useMemo(() => {
-    const map = new Map<
-      string,
-      {
-        provider: string;
-        calls: number;
-        rpmLimit: number;
-        inflight: number;
-        coolingSlot: { name: string; remaining: number } | null;
-        slotCount: number;
-      }
-    >();
-    for (const w of snap.workers) {
-      const prov = (w.provider || 'local').toLowerCase();
-      const existing = map.get(prov) ?? {
-        provider: prov,
-        calls: 0,
-        rpmLimit: w.rpm_limit ?? 40,
-        inflight: 0,
-        coolingSlot: null,
-        slotCount: 0,
-      };
-      existing.calls += w.calls_24h;
-      existing.rpmLimit = w.rpm_limit ?? existing.rpmLimit;
-      existing.inflight += w.inflight ?? (w.status === 'active' ? 1 : 0);
-      existing.slotCount += 1;
-      if (w.status === 'down' && !existing.coolingSlot) {
-        existing.coolingSlot = { name: w.name, remaining: w.cooling_remaining_s ?? 0 };
-      }
-      map.set(prov, existing);
+  // Callers of work that is running now (idle graph shows none).
+  const activeCallers = useMemo(() => {
+    const seen = new Map<string, number>();
+    for (const s of running) {
+      const c = s.caller ?? 'shell';
+      seen.set(c, (seen.get(c) ?? 0) + 1);
     }
-    return Array.from(map.values());
+    return Array.from(seen.entries());
+  }, [running]);
+
+  // Providers, with every key listed (no slicing).
+  const providers = useMemo(() => {
+    const map = new Map<string, WorkerStatus[]>();
+    for (const w of snap.workers) {
+      const p = (w.provider || 'local').toLowerCase();
+      map.set(p, [...(map.get(p) ?? []), w]);
+    }
+    return Array.from(map.entries()).map(([provider, workers]) => ({
+      provider,
+      workers,
+      rpm: workers[0]?.rpm_limit ?? 0,
+      calls: workers.reduce((n, w) => n + w.calls_24h, 0),
+      inflight: workers.reduce((n, w) => n + (w.inflight ?? 0), 0),
+      active: workers.some((w) => w.status === 'active'),
+    }));
   }, [snap.workers]);
 
-  const sessionCounts = useMemo(() => {
-    let active = 0;
-    let blocked = 0;
-    let done = 0;
-    for (const s of snap.sessions) {
-      if (s.state === 'running' || s.state === 'leased') active += 1;
-      else if (s.state === 'blocked' || s.state === 'escalated' || s.state === 'failed') blocked += 1;
-      else if (s.state === 'done') done += 1;
-    }
-    return { all: snap.sessions.length, active, blocked, done };
-  }, [snap.sessions]);
+  const activeKeys = new Set(snap.workers_live.map((w) => w.key).filter(Boolean));
+  const activeProviders = providers.filter((p) => p.workers.some((w) => activeKeys.has(w.key ?? '')));
 
-  const filteredSessions = useMemo(() => {
-    const list = snap.sessions.filter((s) => {
-      if (sessionFilter === 'all') return true;
-      if (sessionFilter === 'active') return s.state === 'running' || s.state === 'leased';
-      if (sessionFilter === 'blocked')
-        return s.state === 'blocked' || s.state === 'escalated' || s.state === 'failed';
-      return s.state === 'done';
-    });
-    return showAllSessions ? list : list.slice(0, 5);
-  }, [snap.sessions, sessionFilter, showAllSessions]);
-
-  const localClis = state.discovery.agents.slice(0, 3);
-
-  if (unmounted) {
-    return (
-      <div className="w-full max-w-[900px] mx-auto rounded-2xl border border-zinc-200 dark:border-white/[0.08] bg-white dark:bg-[#0f1118] p-5 flex items-center justify-between gap-4 shadow-sm">
-        <div className="text-xs font-mono text-zinc-600 dark:text-slate-400">
-          Popover minimized · daemon remains bound to 127.0.0.1:8799.
-        </div>
-        <button
-          type="button"
-          onClick={() => setUnmounted(false)}
-          className="px-3 py-1.5 rounded-lg bg-zinc-900 dark:bg-slate-100 text-white dark:text-zinc-900 text-xs font-semibold"
-        >
-          Reopen Popover
-        </button>
-      </div>
-    );
+  let gatePass = 0;
+  let gateFail = 0;
+  for (const s of running) {
+    const g = (s.steps ?? []).find((st: SessionStep) => st.stage === 'gate');
+    if (!g) continue;
+    if (g.tone === 'warn') gateFail += 1;
+    else gatePass += 1;
   }
 
+  const routerJobs = snap.jobs.filter((j) => j.source === 'lingonberry');
+
   return (
-    <section
-      aria-label="Lingonberry Router Menu Bar Popover"
-      className="w-full max-w-[900px] mx-auto rounded-2xl bg-white dark:bg-[#0f1118] text-zinc-800 dark:text-slate-200 border border-zinc-200 dark:border-white/[0.08] shadow-lg dark:shadow-[0_25px_60px_-15px_rgba(0,0,0,0.8)] overflow-hidden flex flex-col"
-    >
-      {/* Popover Top Header */}
-      <header className="px-4 py-3 bg-[#f8f9fb] dark:bg-[#13151f] border-b border-zinc-200 dark:border-white/[0.07] flex items-center justify-between gap-3">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-6 h-6 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-600 dark:text-emerald-400 shrink-0">
-            <GitFork className="w-3.5 h-3.5" />
+    <section className="w-[900px] max-w-full rounded-2xl bg-[#0f1118] text-slate-200 border border-white/[0.08] shadow-popover overflow-hidden flex flex-col">
+      <style>{`
+        @keyframes lb-flow { to { stroke-dashoffset: -20; } }
+        .lb-flow { stroke-dasharray: 5 5; animation: lb-flow 1.1s linear infinite; }
+      `}</style>
+
+      {/* header */}
+      <header className="px-4 py-3 bg-[#13151f] border-b border-white/[0.07] flex items-center justify-between select-none">
+        <div className="flex items-center space-x-3">
+          <div className="w-6 h-6 rounded-lg bg-emerald-500/10 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
+            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} viewBox="0 0 24 24">
+              <circle cx="12" cy="12" r="2.5"></circle>
+              <path d="M12 2v3m0 14v3M2 12h3m14 0h3m-3.8-6.8l-2.1 2.1m-6.4 6.4l-2.1 2.1m0-10.6l2.1 2.1m6.4 6.4l2.1 2.1"></path>
+            </svg>
           </div>
-          <h2 className="text-[13px] font-semibold tracking-tight text-zinc-900 dark:text-white font-mono truncate">
-            Lingonberry Router
-          </h2>
+          <h1 className="text-[13px] font-semibold tracking-tight text-white font-mono">Lingonberry Router</h1>
         </div>
-
-        <div className="flex items-center gap-2 shrink-0">
-          <div className="hidden sm:flex items-center gap-2 text-[10.5px] font-mono text-zinc-500 dark:text-slate-400 px-2.5 py-1 rounded-md bg-zinc-100 dark:bg-white/[0.03] border border-zinc-200 dark:border-white/[0.06]">
-            <span>loopback:</span>
-            <span className="text-emerald-600 dark:text-emerald-400 font-medium">
-              127.0.0.1:8799
-            </span>
-            <span className="text-zinc-300 dark:text-white/15">·</span>
-            <span>{state.mode === 'live-api' ? 'local-api' : 'sandbox'}</span>
-          </div>
-
+        <div className="flex items-center space-x-2.5">
+          <span className="hidden sm:inline text-[10px] font-mono text-zinc-500">127.0.0.1:8799</span>
+          <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${hasActive ? 'text-amber-300 border-amber-400/30 bg-amber-400/10' : 'text-zinc-400 border-white/[0.08] bg-white/[0.03]'}`}>
+            {hasActive ? `${running.length} running` : 'idle'}
+          </span>
           <button
             type="button"
+            onClick={() => onRefresh()}
             disabled={busy}
-            onClick={() => void onRefresh()}
-            title="Refresh & Rescan State"
-            className="w-7 h-7 flex items-center justify-center rounded-md text-zinc-500 dark:text-slate-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-200/60 dark:hover:bg-white/[0.06] border border-transparent hover:border-zinc-300 dark:hover:border-white/[0.08] transition disabled:opacity-50"
+            title="Refresh state"
+            aria-label="Refresh state"
+            className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition"
           >
-            <RefreshCw className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setUnmounted(true)}
-            className="px-2.5 py-1 rounded-md text-[11px] font-mono text-zinc-600 dark:text-slate-300 hover:text-rose-700 dark:hover:text-rose-300 hover:bg-rose-500/10 border border-zinc-200 dark:border-white/[0.08] transition"
-          >
-            Hide
+            <svg className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} viewBox="0 0 24 24">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
+            </svg>
           </button>
         </div>
       </header>
 
-      {/* Main Canvas */}
-      <div className="p-3.5 space-y-3.5 bg-[#f4f5f7]/60 dark:bg-[#0c0e13]">
-        {/* Telemetry Strip + 24h Distribution Bar */}
-        <div className="bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08] rounded-xl p-3 font-mono space-y-2">
-          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] tabular-nums">
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-              <div className="flex items-center gap-1.5">
-                <span
-                  className={`w-2 h-2 rounded-full ${
-                    snap.overview.running > 0 ? 'bg-sky-500' : 'bg-emerald-500'
-                  }`}
-                />
-                <span className="text-zinc-500 dark:text-slate-400">running:</span>
-                <span className="text-zinc-900 dark:text-white font-semibold">
-                  {snap.overview.running} active
-                </span>
-              </div>
-              <span className="text-zinc-300 dark:text-white/15">·</span>
-              <div>
-                <span className="text-zinc-500 dark:text-slate-400">avg: </span>
-                <span className="text-zinc-800 dark:text-slate-200">
-                  {snap.overview.avg_duration_s !== null
-                    ? `${snap.overview.avg_duration_s.toFixed(1)}s`
-                    : '—'}
-                </span>
-              </div>
-              <span className="text-zinc-300 dark:text-white/15">·</span>
-              <div>
-                <span className="text-zinc-500 dark:text-slate-400">keys: </span>
-                <span className="text-zinc-800 dark:text-slate-200">
-                  {stats.healthyKeys}/{snap.workers.length}
-                </span>
-              </div>
-              <span className="text-zinc-300 dark:text-white/15">·</span>
-              <div>
-                <span className="text-zinc-500 dark:text-slate-400">cron pids: </span>
-                <span className="text-zinc-800 dark:text-slate-200">{snap.cron_live.length}</span>
-              </div>
-              <span className="text-zinc-300 dark:text-white/15">·</span>
-              <div>
-                <span className="text-zinc-500 dark:text-slate-400">pass rate: </span>
-                <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
-                  {stats.successPct}%
-                </span>
-              </div>
-            </div>
-            <div className="text-[10px] text-zinc-400 dark:text-slate-500">
-              {snap.overview.calls_24h ?? snap.sessions.length} tasks recorded
-            </div>
-          </div>
-
-          <div className="space-y-1">
-            <div className="flex h-1.5 w-full rounded-full overflow-hidden bg-zinc-200 dark:bg-white/[0.06]">
-              <div
-                className="bg-emerald-500 h-full transition-all"
-                style={{ width: `${(stats.passed / stats.total) * 100}%` }}
-                title={`${stats.passed} passed`}
-              />
-              {stats.blocked > 0 && (
-                <div
-                  className="bg-amber-500 h-full transition-all"
-                  style={{ width: `${(stats.blocked / stats.total) * 100}%` }}
-                  title={`${stats.blocked} blocked`}
-                />
-              )}
-              {stats.failed > 0 && (
-                <div
-                  className="bg-rose-500 h-full transition-all"
-                  style={{ width: `${(stats.failed / stats.total) * 100}%` }}
-                  title={`${stats.failed} failed`}
-                />
-              )}
-            </div>
-            <div className="flex items-center justify-between text-[10px] text-zinc-500 dark:text-slate-500 tabular-nums">
-              <div className="flex items-center gap-3">
-                <span>
-                  <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
-                    {stats.passed}
-                  </span>{' '}
-                  passed
-                </span>
-                <span>
-                  <span className="text-amber-600 dark:text-amber-400 font-semibold">
-                    {stats.blocked}
-                  </span>{' '}
-                  blocked
-                </span>
-                <span>
-                  <span className="text-rose-600 dark:text-rose-400 font-semibold">
-                    {stats.failed}
-                  </span>{' '}
-                  failed
-                </span>
-              </div>
-              <span>past 24h</span>
-            </div>
-          </div>
+      <div className="p-3.5 space-y-3.5 overflow-y-auto max-h-[88vh]">
+        {/* summary: plain text, no bars */}
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-1 px-1 font-mono text-[11px] text-zinc-400">
+          <span>running <span className={hasActive ? 'text-amber-300' : 'text-zinc-200'}>{running.length}</span></span>
+          <span>avg <span className="text-zinc-200">{snap.overview.avg_duration_s == null ? '—' : dur(snap.overview.avg_duration_s)}</span></span>
+          <span>cost <span className="text-zinc-500">not measured</span></span>
+          <span>success <span className="text-zinc-200">{successPct == null ? '—' : `${successPct.toFixed(0)}%`}</span></span>
+          <span className="ml-auto text-zinc-500">{snap.sessions.length} tasks · 24h</span>
         </div>
 
-        {/* Interactive Dispatch Strip */}
-        <section className="bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08] rounded-xl p-3">
-          <div className="flex flex-col sm:flex-row gap-2">
-            <select
-              aria-label="Caller agent"
-              value={caller}
-              onChange={(e) => setCaller(e.target.value)}
-              className="h-8 px-2.5 rounded-lg border border-zinc-200 dark:border-white/[0.08] bg-[#f8f9fb] dark:bg-[#0c0e14] text-[11px] font-mono text-zinc-800 dark:text-slate-200"
-            >
-              <option value="claude">caller: claude</option>
-              <option value="codex">caller: codex</option>
-              <option value="opencode">caller: opencode</option>
-              <option value="shell">caller: shell</option>
-            </select>
-
-            <input
-              type="text"
-              aria-label="Raw prompt"
-              value={prompt}
-              onChange={(e) => setPrompt(e.target.value)}
-              placeholder="Raw prompt to cook, route, and verify…"
-              className="flex-1 h-8 px-3 rounded-lg border border-zinc-200 dark:border-white/[0.08] bg-[#f8f9fb] dark:bg-[#0c0e14] text-xs text-zinc-900 dark:text-slate-100 placeholder:text-zinc-400 dark:placeholder:text-slate-500 focus:outline-none focus:border-amber-500/60"
-            />
-
-            <div className="flex items-center gap-1.5">
-              <button
-                type="button"
-                disabled={busy || !prompt.trim()}
-                onClick={() => void onRoute({ prompt, caller, worktree })}
-                className="h-8 px-2.5 rounded-lg border border-zinc-200 dark:border-white/[0.08] bg-[#f8f9fb] dark:bg-[#0c0e14] hover:bg-zinc-100 dark:hover:bg-[#171a25] text-[11px] font-mono font-medium text-zinc-700 dark:text-slate-200 disabled:opacity-45"
-              >
-                Route
-              </button>
-              <button
-                type="button"
-                disabled={busy || !prompt.trim()}
-                onClick={() =>
-                  void onRun({
-                    prompt,
-                    caller,
-                    worktree,
-                    simulate_fault: fault,
-                    live_api: useLiveGemini,
-                  })
-                }
-                className="h-8 px-3 rounded-lg bg-zinc-900 dark:bg-[#e5a950] text-white dark:text-[#1b1200] hover:opacity-90 text-[11px] font-semibold disabled:opacity-45"
-              >
-                Run
-              </button>
-              <button
-                type="button"
-                disabled={busy || !prompt.trim()}
-                onClick={() => void onFanout({ prompt, caller, worktree })}
-                className="h-8 px-2.5 rounded-lg border border-zinc-200 dark:border-white/[0.08] bg-[#f8f9fb] dark:bg-[#0c0e14] hover:bg-zinc-100 dark:hover:bg-[#171a25] text-[11px] font-mono font-medium text-zinc-700 dark:text-slate-200 disabled:opacity-45"
-              >
-                Fanout ×3
-              </button>
+        {/* graph */}
+        <section className="bg-[#11131b] border border-white/[0.07] rounded-xl p-4">
+          {!hasActive ? (
+            <div className="flex flex-col items-center justify-center py-5 gap-2">
+              <div className="px-5 py-2.5 rounded-xl border border-white/[0.1] bg-[#0c0e14] text-[12px] font-mono text-zinc-300">Router</div>
+              <span className="text-[10px] font-mono text-zinc-600">idle · nothing running</span>
             </div>
-          </div>
-
-          <div className="mt-2 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-500 dark:text-slate-400">
-            <div className="flex flex-wrap items-center gap-3">
-              <label className="inline-flex items-center gap-1.5 cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={worktree}
-                  onChange={(e) => setWorktree(e.target.checked)}
-                  className="rounded border-zinc-300 dark:border-white/20"
-                />
-                <span className="font-mono text-[10.5px]">--worktree gate</span>
-              </label>
-
-              <label className="inline-flex items-center gap-1.5">
-                <span className="font-mono text-[10.5px]">fault:</span>
-                <select
-                  value={fault}
-                  onChange={(e) => setFault(e.target.value as 'none' | '429' | 'truncated')}
-                  className="px-1.5 py-0.5 rounded border border-zinc-200 dark:border-white/[0.08] bg-[#f8f9fb] dark:bg-[#0c0e14] text-[10.5px] font-mono text-zinc-700 dark:text-slate-300"
-                >
-                  <option value="none">none</option>
-                  <option value="429">429 burst (failover)</option>
-                  <option value="truncated">truncated output</option>
-                </select>
-              </label>
-
-              {state.capabilities.live_gemini_available && (
-                <label className="inline-flex items-center gap-1.5 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={useLiveGemini}
-                    onChange={(e) => setUseLiveGemini(e.target.checked)}
-                    className="rounded border-zinc-300 dark:border-white/20"
-                  />
-                  <span className="font-mono text-[10.5px] text-emerald-600 dark:text-emerald-400">
-                    live GEMINI_API_KEY
-                  </span>
-                </label>
-              )}
-            </div>
-
-            {onOpenAgentsTab && (
-              <button
-                type="button"
-                onClick={onOpenAgentsTab}
-                className="font-mono text-[10.5px] text-zinc-500 dark:text-slate-400 hover:text-zinc-900 dark:hover:text-white"
-              >
-                self-config &amp; skills →
-              </button>
-            )}
-          </div>
-        </section>
-
-        {/* 4-Column Orchestration Graph */}
-        <OrchestrationGraph
-          workers={snap.workers}
-          workersLive={snap.workers_live}
-          sessions={snap.sessions}
-          activeSessionId={expandedSessionId}
-          onSelectSession={(id) =>
-            setExpandedSessionId((prev) => (prev === id ? null : id))
-          }
-        />
-
-        {/* 3-Column Bento Grid: Workers | Providers | Scheduled Tasks */}
-        <div className="grid grid-cols-12 gap-3">
-          {/* Column 1: Workers */}
-          <section className="col-span-12 md:col-span-4 bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08] rounded-xl p-3 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between pb-2 border-b border-zinc-200/80 dark:border-white/[0.06] mb-2.5 text-xs">
-                <div className="flex items-center gap-1.5">
-                  <span
-                    className={`w-2 h-2 rounded-full ${
-                      snap.workers_live.length > 0 ? 'bg-sky-500' : 'bg-emerald-500'
-                    }`}
-                  />
-                  <span className="font-mono uppercase tracking-wider text-[11px] font-semibold text-zinc-700 dark:text-slate-200">
-                    Workers
-                  </span>
-                </div>
-                <span className="text-[10px] text-zinc-500 dark:text-slate-400 font-mono tabular-nums">
-                  {snap.workers_live.length} running · {snap.workers.length} slots
-                </span>
+          ) : (
+            <div className="grid grid-cols-[1fr_44px_auto_44px_1fr] items-center gap-0">
+              <div className="space-y-2">
+                {activeCallers.map(([c, n]) => (
+                  <div key={c} className="px-3 py-2 rounded-lg border border-sky-400/30 bg-sky-400/[0.06] flex items-center justify-between text-[11px] font-mono">
+                    <span className="text-sky-200 truncate">{c}</span>
+                    <span className="text-sky-300/70">{n}</span>
+                  </div>
+                ))}
               </div>
-
-              <div className="space-y-2 font-mono">
+              <Wire />
+              <div className="px-4 py-3 rounded-xl border border-amber-400/40 bg-amber-400/[0.07] text-center">
+                <div className="text-[12px] font-mono font-semibold text-amber-200">Router</div>
+                <div className="text-[10px] font-mono text-amber-300/70 mt-0.5">{running.length} dispatching</div>
+              </div>
+              <Wire />
+              <div className="space-y-2">
                 {snap.workers_live.map((w) => (
-                  <div
-                    key={`${w.pid}-${w.worker}`}
-                    className="p-2 rounded-lg bg-[#f8f9fb] dark:bg-[#0c0e14] border border-sky-500/30 space-y-1.5"
-                  >
-                    <div className="flex items-center justify-between gap-2 text-[11px]">
-                      <div className="flex items-center gap-1.5 min-w-0">
-                        <span className="w-1.5 h-1.5 rounded-full bg-sky-500 shrink-0" />
-                        <span className="font-semibold text-zinc-900 dark:text-white truncate">
-                          {w.worker}
-                        </span>
-                        <span className="text-[9.5px] text-zinc-400 dark:text-slate-500">
-                          pid {w.pid}
-                        </span>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => void onKillWorker(w.pid)}
-                        className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] text-rose-700 dark:text-rose-300 bg-rose-500/10 hover:bg-rose-500/20 border border-rose-500/30 transition shrink-0"
-                      >
-                        <Square className="w-2.5 h-2.5" />
-                        kill
-                      </button>
-                    </div>
-                    <p className="text-[10.5px] text-zinc-600 dark:text-slate-300 truncate">
-                      {w.task}
-                    </p>
-                    <div className="flex items-center justify-between text-[9.5px] text-zinc-500 dark:text-slate-500 pt-1 border-t border-zinc-200/70 dark:border-white/[0.04] tabular-nums">
-                      <span>active {formatElapsed(w.elapsed_s)}</span>
-                      <span className="text-sky-600 dark:text-sky-400">
-                        {w.key ?? 'local-cli'}
-                      </span>
-                    </div>
+                  <div key={w.pid} className="px-3 py-2 rounded-lg border border-amber-400/30 bg-amber-400/[0.06] flex items-center justify-between text-[11px] font-mono">
+                    <span className="text-amber-200 truncate">{w.worker}</span>
+                    <span className="text-amber-300/70 truncate ml-2">{w.key ?? ''}</span>
                   </div>
                 ))}
-
-                {snap.workers.slice(0, snap.workers_live.length > 0 ? 2 : 4).map((slot) => (
-                  <div
-                    key={slot.name}
-                    className="p-2 rounded-lg bg-[#f8f9fb] dark:bg-[#0c0e14]/70 border border-zinc-200/80 dark:border-white/[0.05] flex items-center justify-between gap-2 text-[10.5px]"
-                  >
-                    <div className="flex items-center gap-1.5 min-w-0">
-                      <span
-                        className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                          slot.status === 'down'
-                            ? 'bg-amber-500'
-                            : slot.status === 'active'
-                              ? 'bg-sky-500'
-                              : 'bg-emerald-500'
-                        }`}
-                      />
-                      <span className="truncate text-zinc-700 dark:text-slate-300">
-                        {slot.name}
-                      </span>
+                {activeProviders.length === 0 && snap.workers_live.length === 0 && <div className="text-[10px] font-mono text-zinc-600">no worker yet</div>}
+                <div className="pt-1 space-y-1">
+                  {gateFail + gatePass > 0 && (
+                    <div className="flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                      <span>gates</span>
+                      <span><span className="text-emerald-300">{gatePass} pass</span> · <span className={gateFail ? 'text-rose-300' : 'text-zinc-600'}>{gateFail} fail</span></span>
                     </div>
-                    {slot.status === 'down' ? (
-                      <button
-                        type="button"
-                        onClick={() => void onResetKey(slot.name)}
-                        className="text-[9.5px] text-amber-600 dark:text-amber-400 hover:underline shrink-0"
-                      >
-                        cool {slot.cooling_remaining_s ?? 0}s · reset
-                      </button>
-                    ) : (
-                      <span className="text-[9.5px] text-emerald-600 dark:text-emerald-400 shrink-0 tabular-nums">
-                        {slot.ok_24h} ok
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            </div>
-          </section>
-
-          {/* Column 2: Providers (+ / - live RPM cap) */}
-          <section className="col-span-12 md:col-span-4 bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08] rounded-xl p-3 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between pb-2 border-b border-zinc-200/80 dark:border-white/[0.06] mb-2.5 text-xs">
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-amber-500" />
-                  <span className="font-mono uppercase tracking-wider text-[11px] font-semibold text-zinc-700 dark:text-slate-200">
-                    Providers
-                  </span>
+                  )}
                 </div>
-                <span className="text-[10px] text-zinc-500 dark:text-slate-400 font-mono">
-                  {providerGroups.length} remote · {localClis.length} local
-                </span>
               </div>
-
-              <div className="space-y-2 font-mono">
-                {providerGroups.slice(0, 3).map((pg) => {
-                  const pct = Math.min(100, Math.round((pg.calls / Math.max(1, pg.rpmLimit)) * 100));
-                  return (
-                    <div
-                      key={pg.provider}
-                      className="p-2 rounded-lg bg-[#f8f9fb] dark:bg-[#0c0e14] border border-zinc-200/80 dark:border-white/[0.06] space-y-1.5"
-                    >
-                      <div className="flex items-center justify-between text-[11px]">
-                        <span className="font-semibold text-zinc-800 dark:text-slate-200 flex items-center gap-1.5 uppercase">
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full ${
-                              pg.coolingSlot ? 'bg-amber-500' : 'bg-emerald-500'
-                            }`}
-                          />
-                          {pg.provider}
-                        </span>
-                        {pg.coolingSlot ? (
-                          <button
-                            type="button"
-                            onClick={() => void onResetKey(pg.coolingSlot!.name)}
-                            className="text-[9.5px] text-amber-700 dark:text-amber-300 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/25 hover:bg-amber-500/20"
-                          >
-                            reset {pg.coolingSlot.name}
-                          </button>
-                        ) : (
-                          <span className="text-[9.5px] text-zinc-500 dark:text-slate-400">
-                            {pg.slotCount} {pg.slotCount === 1 ? 'key' : 'keys'}
-                          </span>
-                        )}
-                      </div>
-
-                      <div className="flex items-center justify-between text-[9.5px] text-zinc-500 dark:text-slate-400 tabular-nums">
-                        <span>
-                          {pg.calls} calls · {pg.rpmLimit} RPM cap
-                        </span>
-                        <div className="flex items-center gap-1">
-                          <button
-                            type="button"
-                            aria-label={`Decrease ${pg.provider} RPM limit`}
-                            onClick={() =>
-                              void onAdjustProviderRpm(pg.provider, Math.max(5, pg.rpmLimit - 5))
-                            }
-                            className="w-4 h-4 flex items-center justify-center rounded bg-zinc-200/70 dark:bg-white/[0.05] hover:bg-zinc-300 dark:hover:bg-white/[0.12] text-zinc-700 dark:text-slate-200 border border-zinc-300 dark:border-white/[0.08]"
-                          >
-                            -
-                          </button>
-                          <span className="px-1 font-semibold text-zinc-800 dark:text-slate-200">
-                            {pg.rpmLimit}
-                          </span>
-                          <button
-                            type="button"
-                            aria-label={`Increase ${pg.provider} RPM limit`}
-                            onClick={() =>
-                              void onAdjustProviderRpm(pg.provider, Math.min(300, pg.rpmLimit + 5))
-                            }
-                            className="w-4 h-4 flex items-center justify-center rounded bg-zinc-200/70 dark:bg-white/[0.05] hover:bg-zinc-300 dark:hover:bg-white/[0.12] text-zinc-700 dark:text-slate-200 border border-zinc-300 dark:border-white/[0.08]"
-                          >
-                            +
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="h-1 w-full bg-zinc-200 dark:bg-white/[0.06] rounded-full overflow-hidden">
-                        <div
-                          className={`h-full rounded-full transition-all duration-300 ${
-                            pg.coolingSlot ? 'bg-amber-500' : 'bg-emerald-500'
-                          }`}
-                          style={{ width: `${Math.max(8, pct)}%` }}
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="mt-2 pt-1.5 border-t border-zinc-200/80 dark:border-white/[0.05] flex items-center justify-between text-[9.5px] font-mono text-zinc-500 dark:text-slate-400">
-              <span>Local CLIs:</span>
-              <div className="flex items-center gap-2 truncate">
-                {localClis.map((a, idx) => (
-                  <React.Fragment key={a.id}>
-                    {idx > 0 && <span className="text-zinc-300 dark:text-white/15">·</span>}
-                    <span className="text-zinc-700 dark:text-slate-300">{a.id}</span>
-                  </React.Fragment>
-                ))}
-              </div>
-            </div>
-          </section>
-
-          {/* Column 3: Scheduled Tasks */}
-          <section className="col-span-12 md:col-span-4 bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08] rounded-xl p-3 flex flex-col justify-between">
-            <div>
-              <div className="flex items-center justify-between pb-2 border-b border-zinc-200/80 dark:border-white/[0.06] mb-2.5 text-xs">
-                <div className="flex items-center gap-1.5">
-                  <span className="w-2 h-2 rounded-full bg-amber-500" />
-                  <span className="font-mono uppercase tracking-wider text-[11px] font-semibold text-zinc-700 dark:text-slate-200">
-                    Scheduled Tasks
-                  </span>
-                </div>
-                <button
-                  type="button"
-                  onClick={onOpenCronTab}
-                  className="text-[10px] font-mono text-sky-600 dark:text-sky-400 hover:underline"
-                >
-                  oversight →
-                </button>
-              </div>
-
-              <div className="space-y-2 font-mono">
-                {snap.jobs.slice(0, 3).map((job) => {
-                  const isCrashed = job.health === 'crashed';
-                  return (
-                    <div
-                      key={job.name}
-                      className="p-2 rounded-lg bg-[#f8f9fb] dark:bg-[#0c0e14] border border-zinc-200/80 dark:border-white/[0.06] flex items-center justify-between gap-2"
-                    >
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-center gap-1.5 text-[11px] text-zinc-800 dark:text-slate-200">
-                          <span
-                            className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                              isCrashed
-                                ? 'bg-rose-500'
-                                : job.health === 'running'
-                                  ? 'bg-sky-500'
-                                  : job.paused
-                                    ? 'bg-amber-500'
-                                    : 'bg-emerald-500'
-                            }`}
-                          />
-                          <span className="truncate font-medium">{job.name}</span>
-                        </div>
-                        <div className="text-[9.5px] text-zinc-500 dark:text-slate-500 mt-0.5 pl-3 truncate">
-                          {job.schedule} ·{' '}
-                          <span
-                            className={
-                              isCrashed
-                                ? 'text-rose-600 dark:text-rose-400'
-                                : job.paused
-                                  ? 'text-amber-600 dark:text-amber-400'
-                                  : ''
-                            }
-                          >
-                            {job.paused ? 'paused' : job.health}
-                          </span>
-                        </div>
-                      </div>
-
-                      <div className="flex items-center gap-1 shrink-0">
-                        {isCrashed ? (
-                          <button
-                            type="button"
-                            onClick={() => void onHealJob(job.name)}
-                            className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[9.5px] bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30"
-                          >
-                            <RotateCcw className="w-2.5 h-2.5" />
-                            Heal
-                          </button>
-                        ) : (
-                          <button
-                            type="button"
-                            onClick={() => void onToggleJob(job.name)}
-                            className="px-1.5 py-0.5 rounded text-[9.5px] bg-white dark:bg-white/[0.04] hover:bg-zinc-100 dark:hover:bg-white/[0.08] text-zinc-600 dark:text-slate-300 border border-zinc-200 dark:border-white/[0.06] transition"
-                          >
-                            {job.paused ? 'Resume' : 'Pause'}
-                          </button>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => void onRunJob(job.name)}
-                          className="px-1.5 py-0.5 rounded text-[9.5px] bg-white dark:bg-white/[0.04] hover:bg-emerald-500/15 hover:text-emerald-700 dark:hover:text-emerald-300 text-zinc-600 dark:text-slate-300 border border-zinc-200 dark:border-white/[0.06] transition"
-                        >
-                          Run
-                        </button>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="mt-2 pt-1.5 border-t border-zinc-200/80 dark:border-white/[0.05] flex items-center justify-between text-[9.5px] font-mono text-zinc-500 dark:text-slate-400">
-              <span>{snap.jobs.length} host + router jobs</span>
-              <span>{snap.cron_live.length} active PIDs</span>
-            </div>
-          </section>
-        </div>
-
-        {/* Sessions / Traces with Filter Tabs + Expandable Timelines */}
-        <section className="bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08] rounded-xl p-3.5 space-y-3 font-mono">
-          <div className="flex flex-wrap items-center justify-between pb-2.5 border-b border-zinc-200/80 dark:border-white/[0.06] gap-2 text-xs">
-            <div className="flex items-center gap-2">
-              <span className="font-semibold uppercase tracking-wider text-[11px] text-zinc-800 dark:text-slate-200">
-                Sessions / Traces
-              </span>
-              <span className="text-zinc-500 dark:text-slate-500 text-[10px]">
-                {filteredSessions.length} shown · {snap.sessions.length} total
-              </span>
-            </div>
-
-            <div
-              role="tablist"
-              aria-label="Filter sessions"
-              className="flex items-center gap-1 bg-[#f4f5f7] dark:bg-[#0c0e14] p-0.5 rounded-lg border border-zinc-200 dark:border-white/[0.06] text-[10px]"
-            >
-              {(
-                [
-                  { id: 'all', label: `All (${sessionCounts.all})` },
-                  { id: 'active', label: `Active (${sessionCounts.active})` },
-                  { id: 'blocked', label: `Blocked (${sessionCounts.blocked})` },
-                  { id: 'done', label: `Done (${sessionCounts.done})` },
-                ] as const
-              ).map((t) => {
-                const active = sessionFilter === t.id;
-                return (
-                  <button
-                    key={t.id}
-                    type="button"
-                    role="tab"
-                    aria-selected={active}
-                    onClick={() => setSessionFilter(t.id)}
-                    className={`px-2 py-0.5 rounded transition ${
-                      active
-                        ? 'bg-white dark:bg-white/[0.1] text-zinc-900 dark:text-white font-semibold shadow-2xs'
-                        : 'text-zinc-500 dark:text-slate-400 hover:text-zinc-900 dark:hover:text-white'
-                    }`}
-                  >
-                    {t.label}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-
-          <div className="space-y-2">
-            {filteredSessions.length === 0 ? (
-              <div className="p-3 rounded-lg bg-[#f8f9fb] dark:bg-[#0c0e14] border border-zinc-200/80 dark:border-white/[0.05] text-[11px] text-zinc-500 dark:text-slate-400">
-                No sessions match this filter.
-              </div>
-            ) : (
-              filteredSessions.map((s) => {
-                const open = expandedSessionId === s.id;
-                const isRunning = s.state === 'running' || s.state === 'leased';
-                const isBlocked =
-                  s.state === 'blocked' || s.state === 'escalated' || s.state === 'failed';
-                const statusBadgeClass = isRunning
-                  ? 'bg-sky-500/12 text-sky-700 dark:text-sky-300 border-sky-500/30'
-                  : isBlocked
-                    ? 'bg-amber-500/12 text-amber-700 dark:text-amber-300 border-amber-500/30'
-                    : 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-300 border-emerald-500/25';
-
-                return (
-                  <div
-                    key={s.id}
-                    className={`rounded-lg border transition overflow-hidden ${
-                      isRunning
-                        ? 'bg-[#f8f9fb] dark:bg-[#0c0e14] border-sky-500/30'
-                        : isBlocked
-                          ? 'bg-[#f8f9fb] dark:bg-[#0c0e14] border-amber-500/25'
-                          : 'bg-[#f8f9fb] dark:bg-[#0c0e14] border-zinc-200 dark:border-white/[0.06]'
-                    }`}
-                  >
-                    <button
-                      type="button"
-                      onClick={() => setExpandedSessionId(open ? null : s.id)}
-                      className="w-full p-2.5 text-left hover:bg-zinc-100/70 dark:hover:bg-[#10131d] transition"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="flex items-start gap-2 min-w-0">
-                          {open ? (
-                            <ChevronDown className="w-3.5 h-3.5 mt-0.5 shrink-0 text-zinc-400" />
-                          ) : (
-                            <ChevronRight className="w-3.5 h-3.5 mt-0.5 shrink-0 text-zinc-400" />
-                          )}
-                          <span className="text-[10px] text-zinc-500 dark:text-slate-400 pt-0.5 shrink-0 tabular-nums">
-                            {formatTimeOfDay(s.ts)}
-                          </span>
-                          <div className="min-w-0">
-                            <div className="flex flex-wrap items-center gap-1.5">
-                              <span className="text-[11px] font-semibold text-zinc-900 dark:text-white">
-                                {s.worker}
-                              </span>
-                              <span className="text-[9.5px] px-1.5 py-0.2 rounded bg-amber-500/10 text-amber-700 dark:text-amber-300 border border-amber-500/20">
-                                {s.caller ?? 'shell'}
-                              </span>
-                              {s.key && (
-                                <span className="text-[9.5px] text-zinc-500 dark:text-slate-500">
-                                  {s.key}
-                                </span>
-                              )}
-                              {s.failover_from && (
-                                <span className="text-[9.5px] text-amber-600 dark:text-amber-400">
-                                  failover ← {s.failover_from}
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-[11px] text-zinc-600 dark:text-slate-300 leading-snug truncate mt-0.5">
-                              {s.prompt}
-                            </p>
-                          </div>
-                        </div>
-
-                        <div className="flex flex-col items-end shrink-0">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[9.5px] font-semibold border capitalize ${statusBadgeClass}`}
-                          >
-                            {s.state}
-                          </span>
-                          <span className="text-[9.5px] text-zinc-500 dark:text-slate-500 mt-1 tabular-nums">
-                            {s.duration_s.toFixed(1)}s
-                            {s.tokens_in || s.tokens_out
-                              ? ` · ${s.tokens_in ?? 0} in / ${s.tokens_out ?? 0} out`
-                              : ''}
-                          </span>
-                        </div>
-                      </div>
-                    </button>
-
-                    {open && (
-                      <div className="px-3 py-2.5 border-t border-zinc-200/80 dark:border-white/[0.06] bg-white dark:bg-[#090b0e] text-[10.5px] space-y-1.5">
-                        <div className="flex flex-wrap items-center justify-between gap-2 pb-1.5 border-b border-zinc-200/70 dark:border-white/[0.04] text-[9.5px] text-zinc-500 dark:text-slate-400">
-                          <span>receipt: {s.receipt_id ?? 'local-run'}</span>
-                          <span className="text-emerald-600 dark:text-emerald-400">
-                            {s.state === 'done' ? 'Gate: PASS' : `State: ${s.state}`}
-                          </span>
-                        </div>
-
-                        <div className="space-y-1 pl-2 border-l border-zinc-300 dark:border-zinc-700">
-                          {(s.steps ?? []).map((st, idx) => (
-                            <div
-                              key={`${s.id}-${idx}`}
-                              className="text-zinc-700 dark:text-slate-300 leading-snug"
-                            >
-                              <span className="text-zinc-400 dark:text-slate-500">&gt; </span>
-                              <span className="font-semibold">{st.title}</span>
-                              <span className="text-zinc-500 dark:text-slate-400">
-                                {' '}
-                                — {st.detail}
-                              </span>
-                            </div>
-                          ))}
-                        </div>
-
-                        {s.output && (
-                          <pre className="pt-1.5 border-t border-zinc-200/70 dark:border-white/[0.04] text-[10px] whitespace-pre-wrap text-emerald-700 dark:text-emerald-300">
-                            {s.output}
-                          </pre>
-                        )}
-                        {s.reason && (
-                          <div className="text-[10px] text-amber-700 dark:text-amber-300">
-                            {s.reason}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                );
-              })
-            )}
-          </div>
-
-          {snap.sessions.length > 5 && (
-            <div className="pt-2 border-t border-zinc-200/70 dark:border-white/[0.04] flex items-center justify-between text-[10px] text-zinc-500 dark:text-slate-500">
-              <span>Showing {filteredSessions.length} traces</span>
-              <button
-                type="button"
-                onClick={() => setShowAllSessions((v) => !v)}
-                className="text-zinc-600 dark:text-slate-300 hover:underline"
-              >
-                {showAllSessions
-                  ? 'Collapse list'
-                  : `View all ${snap.sessions.length} history logs →`}
-              </button>
             </div>
           )}
         </section>
 
-        {/* Quiet Daemon Footer */}
-        <footer className="pt-2 px-1 flex flex-wrap items-center justify-between text-[10px] text-zinc-500 dark:text-slate-500 font-mono border-t border-zinc-200 dark:border-white/[0.06] gap-y-1">
-          <div className="flex items-center gap-2 truncate">
-            <span className="text-emerald-600 dark:text-emerald-400 font-medium">/daemon</span>
-            <span className="truncate">~/.lingonberry/config.json</span>
-            <span>·</span>
-            <span>127.0.0.1:8799</span>
+        {/* workers, providers, router jobs */}
+        <div className="grid grid-cols-12 gap-3">
+          <section className="col-span-12 md:col-span-4 bg-[#11131b] border border-white/[0.07] rounded-xl p-3">
+            <div className="flex items-center justify-between pb-2 border-b border-white/[0.06] mb-2.5 text-xs">
+              <span className="font-medium text-zinc-200">Workers</span>
+              <span className="text-[10px] text-zinc-500 font-mono">{snap.workers_live.length} running · {snap.workers.length} keys</span>
+            </div>
+            <div className="space-y-2 font-mono">
+              {snap.workers_live.map((w) => (
+                <div key={w.pid} className="p-2 rounded-lg bg-[#0c0e14] border border-amber-400/25 space-y-1">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="font-medium text-amber-200">{w.worker}</span>
+                    <button type="button" onClick={() => onKillWorker(w.pid)} className="px-1.5 py-0.5 rounded text-[9px] text-zinc-400 hover:text-rose-300 bg-white/[0.04] border border-white/[0.06]">stop</button>
+                  </div>
+                  <p className="text-[10px] text-zinc-400 truncate">{w.task}</p>
+                </div>
+              ))}
+              {snap.workers.map((w) => (
+                <div key={w.name} className="px-2 py-1.5 rounded-lg bg-[#0c0e14] flex items-center justify-between text-[10.5px]">
+                  <span className="text-zinc-300 truncate" title={w.name}>{w.key ?? w.name}</span>
+                  <span className={`text-[9.5px] shrink-0 ml-2 ${w.status === 'down' ? 'text-rose-300' : 'text-zinc-500'}`}>
+                    {w.status === 'down' ? `cooldown ${Math.round(w.cooling_remaining_s ?? 0)}s` : `${w.ok_24h} ok`}
+                  </span>
+                </div>
+              ))}
+              {snap.workers.length === 0 && <div className="text-[10px] text-zinc-600">none discovered</div>}
+            </div>
+          </section>
+
+          <section className="col-span-12 md:col-span-4 bg-[#11131b] border border-white/[0.07] rounded-xl p-3">
+            <div className="flex items-center justify-between pb-2 border-b border-white/[0.06] mb-2.5 text-xs">
+              <span className="font-medium text-zinc-200">Providers</span>
+              <span className="text-[10px] text-zinc-500 font-mono">{providers.length} · calls / min</span>
+            </div>
+            <div className="space-y-2 font-mono">
+              {providers.map((p) => {
+                const pct = p.rpm ? Math.min(100, Math.round((p.inflight / p.rpm) * 100)) : 0;
+                return (
+                  <div key={p.provider} className="p-2 rounded-lg bg-[#0c0e14] space-y-1.5">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="text-zinc-200">{p.provider}</span>
+                      <div className="flex items-center gap-1.5 text-[10px] text-zinc-300">
+                        <button type="button" aria-label={`lower ${p.provider} limit`} onClick={() => onAdjustProviderRpm(p.provider, Math.max(5, p.rpm - 5))} className="w-4 h-4 rounded border border-white/[0.08] hover:bg-white/[0.06]">−</button>
+                        <span className="w-14 text-center">{p.rpm}/min</span>
+                        <button type="button" aria-label={`raise ${p.provider} limit`} onClick={() => onAdjustProviderRpm(p.provider, Math.min(300, p.rpm + 5))} className="w-4 h-4 rounded border border-white/[0.08] hover:bg-white/[0.06]">+</button>
+                      </div>
+                    </div>
+                    <div className="h-px w-full bg-white/[0.06]">
+                      <div className="h-px bg-amber-400/70" style={{ width: `${pct}%` }}></div>
+                    </div>
+                    <div className="text-[9.5px] text-zinc-500">{p.workers.length} key{p.workers.length === 1 ? '' : 's'} · {p.calls} calls 24h</div>
+                  </div>
+                );
+              })}
+              {providers.length === 0 && <div className="text-[10px] text-zinc-600">none</div>}
+            </div>
+          </section>
+
+          <section className="col-span-12 md:col-span-4 bg-[#11131b] border border-white/[0.07] rounded-xl p-3">
+            <div className="flex items-center justify-between pb-2 border-b border-white/[0.06] mb-2.5 text-xs">
+              <span className="font-medium text-zinc-200">Router jobs</span>
+              <span className="text-[10px] text-zinc-500 font-mono">{routerJobs.length}</span>
+            </div>
+            <div className="space-y-2 font-mono">
+              {routerJobs.length === 0 && <div className="text-[10px] text-zinc-600">none configured</div>}
+              {routerJobs.map((j) => (
+                <div key={j.name} className="p-2 rounded-lg bg-[#0c0e14] flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-[11px] text-zinc-200 truncate">{j.name}</div>
+                    <div className="text-[9.5px] text-zinc-500">{j.schedule} · {j.last ? ago(j.last) : 'never ran'}</div>
+                  </div>
+                  <div className="flex gap-1 shrink-0">
+                    {onToggleJob && <button type="button" onClick={() => onToggleJob(j.name)} className="px-1.5 py-0.5 rounded text-[9px] text-zinc-400 bg-white/[0.04] border border-white/[0.06]">{j.paused ? 'resume' : 'pause'}</button>}
+                    {onRunJob && <button type="button" onClick={() => onRunJob(j.name)} className="px-1.5 py-0.5 rounded text-[9px] text-zinc-400 bg-white/[0.04] border border-white/[0.06]">run</button>}
+                  </div>
+                </div>
+              ))}
+            </div>
+          </section>
+        </div>
+
+        {/* sessions: conversation view */}
+        <section className="bg-[#11131b] border border-white/[0.07] rounded-xl p-3.5 space-y-3 font-mono">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+            <span className="font-medium text-zinc-200 font-sans">Sessions</span>
+            <div className="flex items-center gap-0.5 bg-[#0c0e14] p-0.5 rounded-lg border border-white/[0.06] text-[10px]">
+              {([
+                ['all', `all ${snap.sessions.length}`],
+                ['active', `running ${running.length}`],
+                ['blocked', `blocked ${blocked.length}`],
+                ['done', `done ${done.length}`],
+              ] as const).map(([key, label]) => (
+                <button key={key} type="button" onClick={() => setFilter(key)} className={`px-2 py-0.5 rounded ${filter === key ? 'bg-white/[0.1] text-white' : 'text-zinc-400 hover:text-zinc-100'}`}>
+                  {label}
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="flex items-center gap-3 shrink-0 tabular-nums">
-            <span>
-              ram:{' '}
-              {snap.system.ram_used_gb !== null ? `${snap.system.ram_used_gb.toFixed(1)} GB` : '—'}
-            </span>
-            <span>
-              cpu: {snap.system.cpu_pct !== null ? `${snap.system.cpu_pct.toFixed(0)}%` : '—'}
-            </span>
-          </div>
+
+          {visibleSessions.length === 0 && <div className="text-[11px] text-zinc-600">no sessions in this view</div>}
+
+          <ul className="space-y-2">
+            {visibleSessions.map((s) => {
+              const open = openId === s.id;
+              const c = s.cooked;
+              const attempts = (s.steps ?? []).filter((st) => st.stage === 'dispatched' || st.stage === 'failover').length;
+              return (
+                <li key={s.id} className={`rounded-lg bg-[#0c0e14] border ${isRunning(s) ? 'border-amber-400/30' : 'border-white/[0.06]'}`}>
+                  <button type="button" aria-expanded={open} onClick={() => setOpenId(open ? null : s.id)} className="w-full text-left p-3 flex items-start gap-3">
+                    <div className="min-w-0 flex-1 space-y-1">
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10.5px]">
+                        <span className="text-zinc-500">{clock(s.ts)}</span>
+                        <span className="text-zinc-100">{s.worker}</span>
+                        <span className="text-zinc-500">via {s.caller ?? 'shell'}</span>
+                        {s.key && <span className="text-zinc-600">{s.key}</span>}
+                      </div>
+                      <p className="text-[12px] text-zinc-200 font-sans leading-snug line-clamp-1">{s.prompt}</p>
+                    </div>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      <StateTag state={s.state} />
+                      <span className="text-[10px] text-zinc-500">{s.duration_s.toFixed(1)}s · {ago(s.ts)}</span>
+                      {attempts > 1 && <span className="text-[10px] text-zinc-400">{attempts} attempts</span>}
+                    </div>
+                  </button>
+
+                  {open && (
+                    <div className="px-3 pb-3 space-y-3 border-t border-white/[0.05] pt-3">
+                      {/* the prompt the user sent */}
+                      <Turn label="You">
+                        <p className="whitespace-pre-wrap break-words font-sans text-[12px] text-zinc-200 leading-relaxed">{s.prompt}</p>
+                      </Turn>
+
+                      {/* what the router did with it */}
+                      <Turn label="Router">
+                        {c ? (
+                          <dl className="grid grid-cols-[72px_1fr] gap-x-3 gap-y-1 text-[11px]">
+                            <dt className="text-zinc-500">class</dt><dd className="text-zinc-200">{c.task_class}</dd>
+                            <dt className="text-zinc-500">skill</dt><dd className="text-zinc-200">{c.selected_skill}</dd>
+                            <dt className="text-zinc-500">command</dt><dd className="text-zinc-200 break-all">{c.selected_command}</dd>
+                            <dt className="text-zinc-500">hook</dt><dd className="text-zinc-200">{c.selected_hook}</dd>
+                            <dt className="text-zinc-500">gate</dt><dd className="text-zinc-200">{c.gate_policy}</dd>
+                            <dt className="text-zinc-500">loop</dt><dd className="text-zinc-200">{attempts || 1} attempt{attempts > 1 ? 's' : ''}</dd>
+                            <dt className="text-zinc-500">context</dt><dd className="text-zinc-400 break-all">{c.retrieval_sources.join(' · ') || '—'}</dd>
+                          </dl>
+                        ) : (
+                          <span className="text-[11px] text-zinc-500">not recorded for this run</span>
+                        )}
+                      </Turn>
+
+                      {/* what the worker answered */}
+                      <Turn label={s.worker} tone={s.state === 'done' ? 'ok' : isBlocked(s) ? 'bad' : 'idle'}>
+                        <div className="relative">
+                          <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md bg-[#090b0e] border border-white/[0.04] p-2.5 text-[11px] leading-relaxed text-zinc-200">
+                            {s.output ?? s.reason ?? (isRunning(s) ? 'working…' : '—')}
+                          </pre>
+                          {s.output && (
+                            <button type="button" onClick={() => copyText(s.output ?? '')} className="absolute top-1.5 right-1.5 px-1.5 py-0.5 rounded text-[9px] text-zinc-400 bg-white/[0.05] border border-white/[0.08] hover:text-zinc-100">copy</button>
+                          )}
+                        </div>
+                      </Turn>
+
+                      {/* steps */}
+                      {(s.steps ?? []).length > 0 && (
+                        <ol className="space-y-1 pl-3 border-l border-white/[0.08] text-[10.5px]">
+                          {(s.steps ?? []).map((st, i) => (
+                            <li key={i} className="flex gap-2">
+                              <span className="text-zinc-600 w-14 shrink-0">{clock(st.ts)}</span>
+                              <span className={st.tone === 'warn' ? 'text-rose-300' : st.tone === 'done' ? 'text-emerald-300' : 'text-zinc-300'}>{st.title}</span>
+                              {st.detail && <span className="text-zinc-500 truncate">{st.detail}</span>}
+                            </li>
+                          ))}
+                        </ol>
+                      )}
+
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-zinc-500">
+                        <span>receipt {s.receipt_id ?? '—'}</span>
+                        <span>{s.tokens_in ?? 0} in · {s.tokens_out ?? 0} out</span>
+                        {s.failover_from && <span>failover from {s.failover_from}</span>}
+                      </div>
+                    </div>
+                  )}
+                </li>
+              );
+            })}
+          </ul>
+          {snap.sessions.length > 8 && (
+            <button type="button" onClick={() => setShowAll((v) => !v)} className="text-[10.5px] text-zinc-400 hover:text-zinc-100">
+              {showAll ? 'show fewer' : `show all ${snap.sessions.length}`}
+            </button>
+          )}
+        </section>
+
+        <footer className="flex items-center justify-between gap-3 pt-1 text-[10px] font-mono text-zinc-600">
+          <span>~/.lingonberry/config.json · poll 2s</span>
+          <span>{snap.system.app_ram_gb != null ? `app ${snap.system.app_ram_gb.toFixed(2)} GB` : ''}</span>
         </footer>
       </div>
     </section>
   );
 };
+
+function Wire() {
+  return (
+    <svg width="44" height="14" viewBox="0 0 44 14" aria-hidden="true" className="justify-self-center">
+      <path d="M0 7 H44" stroke="#fabb60" strokeOpacity={0.6} strokeWidth={1.25} fill="none" className="lb-flow" />
+    </svg>
+  );
+}
+
+function StateTag({ state }: { state: string }) {
+  const cls =
+    state === 'running' || state === 'leased'
+      ? 'text-amber-200 border-amber-400/40'
+      : state === 'done'
+        ? 'text-emerald-300 border-emerald-400/25'
+        : ['blocked', 'escalated', 'failed'].includes(state)
+          ? 'text-rose-300 border-rose-400/30'
+          : 'text-zinc-300 border-white/[0.08]';
+  return <span className={`px-2 py-0.5 rounded border text-[10px] font-mono ${cls}`}>{state}</span>;
+}
+
+function Turn({ label, tone = 'idle', children }: { label: string; tone?: 'ok' | 'bad' | 'idle'; children: React.ReactNode }) {
+  const labelTone = tone === 'ok' ? 'text-emerald-400' : tone === 'bad' ? 'text-rose-400' : 'text-zinc-500';
+  return (
+    <div className="space-y-1">
+      <div className={`text-[9.5px] font-mono uppercase tracking-[0.14em] ${labelTone}`}>{label}</div>
+      {children}
+    </div>
+  );
+}

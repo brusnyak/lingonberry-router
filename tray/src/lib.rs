@@ -1,5 +1,9 @@
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+/// Set once the popover has received focus since it was last shown.
+static FOCUS_SEEN: AtomicBool = AtomicBool::new(false);
 use std::time::Duration;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -12,6 +16,21 @@ const CORE_URL: &str = "http://127.0.0.1:8799";
 
 struct CoreChild(Mutex<Option<Child>>);
 
+/// The core binary bundled next to the tray executable (Contents/MacOS on macOS),
+/// falling back to `lingonberry-core` on PATH for development runs.
+fn core_bin() -> std::path::PathBuf {
+    let name = if cfg!(windows) { "lingonberry-core.exe" } else { "lingonberry-core" };
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join(name);
+            if bundled.exists() {
+                return bundled;
+            }
+        }
+    }
+    std::path::PathBuf::from(name)
+}
+
 fn spawn_core() -> Option<Child> {
     // Do not spawn a duplicate if lingonberry-core is already listening on loopback.
     if std::net::TcpStream::connect_timeout(
@@ -23,7 +42,7 @@ fn spawn_core() -> Option<Child> {
         return None;
     }
 
-    Command::new("lingonberry-core")
+    Command::new(core_bin())
         .args(["serve", CORE_ADDR])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -65,6 +84,7 @@ fn toggle_popover(app: &AppHandle, click_pos: Option<PhysicalPosition<f64>>) {
             let _ = win.set_position(PhysicalPosition::new(x, y));
         }
     }
+    FOCUS_SEEN.store(false, Ordering::SeqCst);
     let _ = win.show();
     let _ = win.set_focus();
 }
@@ -109,17 +129,21 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Quit Lingonberry", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open_item, &doctor_item, &rescan_item, &quit_item])?;
 
+            // Explicit monochrome template icon: without it the menu-bar item can be empty.
+            let tray_icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png"))?;
             let tray = TrayIconBuilder::with_id("lingonberry-tray")
+                .icon(tray_icon)
+                .icon_as_template(true)
                 .menu(&menu)
                 .show_menu_on_left_click(false)
                 .tooltip("Lingonberry Router · 127.0.0.1:8799")
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => toggle_popover(app, None),
                     "doctor" => {
-                        let _ = Command::new("lingonberry-core").arg("doctor").spawn();
+                        let _ = Command::new(core_bin()).arg("doctor").spawn();
                     }
                     "rescan" => {
-                        let _ = Command::new("lingonberry-core").arg("discover").spawn();
+                        let _ = Command::new(core_bin()).arg("discover").spawn();
                     }
                     "quit" => {
                         let core = app.state::<CoreChild>();
@@ -167,13 +191,24 @@ pub fn run() {
                 }
             });
 
+            // Test hook: LINGONBERRY_SHOW_POPOVER=1 opens the popover at launch (used for screenshots).
+            if std::env::var("LINGONBERRY_SHOW_POPOVER").is_ok() {
+                toggle_popover(&app_handle, None);
+            }
+
             // Hide popover automatically when it loses focus (standard menu-bar feel).
+            // Hide only after the popover has really had focus. An accessory app often never gets focus
+            // on show; hiding on that first "unfocused" event made the popover vanish at once.
             if let Some(win) = app_handle.get_webview_window("popover") {
                 let win_clone = win.clone();
-                win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Focused(false) = event {
-                        let _ = win_clone.hide();
+                win.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Focused(true) => FOCUS_SEEN.store(true, Ordering::SeqCst),
+                    tauri::WindowEvent::Focused(false) => {
+                        if FOCUS_SEEN.swap(false, Ordering::SeqCst) {
+                            let _ = win_clone.hide();
+                        }
                     }
+                    _ => {}
                 });
             }
 

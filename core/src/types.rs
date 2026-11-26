@@ -79,7 +79,7 @@ pub struct Run {
     pub created_at: String,
     pub worker: String,
     pub caller: Option<String>,
-    pub key_slot: Option<String>,
+    pub key_name: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub prompt: String,
@@ -153,6 +153,7 @@ pub struct SessionRow {
     pub reason: Option<String>,
     pub output: Option<String>,
     pub receipt_id: Option<String>,
+    pub cooked: Option<CookedPromptInfo>,
     pub steps: Vec<SessionStep>,
     pub fanout_group: Option<String>,
     pub failover_from: Option<String>,
@@ -207,6 +208,11 @@ pub struct SystemInfo {
     pub ram_total_gb: Option<f64>,
     pub disk_used_gb: Option<f64>,
     pub disk_total_gb: Option<f64>,
+    /// This app only (core, plus the tray when it is the parent): CPU in percent of one core, RAM in GB.
+    #[serde(default)]
+    pub app_cpu_pct: Option<f64>,
+    #[serde(default)]
+    pub app_ram_gb: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,7 +277,7 @@ pub struct Receipt {
 pub struct DiscoveredWorker {
     pub id: String,
     pub agent: String,
-    pub key_slot: Option<String>,
+    pub key_name: Option<String>,
     pub provider: String,
     pub base_url: Option<String>,
     pub model: Option<String>,
@@ -288,6 +294,9 @@ pub struct DiscoveryData {
     pub ssh_hosts: Vec<String>,
     pub git_projects: Vec<String>,
     pub browsers: Vec<String>,
+    /// Key names found in other agents' credential stores. Names and providers only, never values.
+    #[serde(default)]
+    pub stores: Vec<crate::stores::StoreKey>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

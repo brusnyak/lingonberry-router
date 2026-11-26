@@ -3,15 +3,35 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+/// Accepts whole seconds written as `60` or `60.0` (the older core wrote floats).
+fn whole_secs<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
+    let v = f64::deserialize(d)?;
+    if v.is_finite() && v >= 0.0 && v.fract() == 0.0 {
+        Ok(v as u64)
+    } else {
+        Err(serde::de::Error::custom("expected a whole number of seconds"))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
     pub default_worker: String,
     pub max_inflight_per_key: usize,
+    /// Default calls per minute for any provider not listed in provider_rpm. Conservative on purpose.
     pub rpm_per_key: usize,
+    /// Per-provider calls per minute. NVIDIA NIM is 40 (owner-confirmed limit).
+    #[serde(default = "default_provider_rpm")]
+    pub provider_rpm: std::collections::BTreeMap<String, usize>,
+    #[serde(deserialize_with = "whole_secs")]
     pub cooldown_s: u64,
+    #[serde(deserialize_with = "whole_secs")]
     pub lease_wait_s: u64,
     pub excluded_agents: Vec<String>,
+}
+
+fn default_provider_rpm() -> std::collections::BTreeMap<String, usize> {
+    [("nim".to_string(), 40)].into_iter().collect()
 }
 
 impl Default for Config {
@@ -20,7 +40,8 @@ impl Default for Config {
             port: 8799,
             default_worker: "pi".to_string(),
             max_inflight_per_key: 3,
-            rpm_per_key: 40,
+            rpm_per_key: 30,
+            provider_rpm: default_provider_rpm(),
             cooldown_s: 60,
             lease_wait_s: 30,
             excluded_agents: vec!["cline".to_string()],
@@ -102,6 +123,22 @@ mod tests {
         assert!(validate_config(&cfg).is_ok());
         assert_eq!(cfg.port, 8799);
         assert_eq!(cfg.max_inflight_per_key, 3);
+    }
+
+    #[test]
+    fn config_written_with_float_seconds_still_loads() {
+        let json = r#"{"port":8799,"default_worker":"pi","max_inflight_per_key":3,
+            "rpm_per_key":40,"cooldown_s":60.0,"lease_wait_s":30.0,"excluded_agents":["cline"]}"#;
+        let cfg: Config = serde_json::from_str(json).expect("float seconds must parse");
+        assert_eq!(cfg.cooldown_s, 60);
+        assert_eq!(cfg.lease_wait_s, 30);
+    }
+
+    #[test]
+    fn fractional_seconds_are_rejected() {
+        let json = r#"{"port":8799,"default_worker":"pi","max_inflight_per_key":3,
+            "rpm_per_key":40,"cooldown_s":1.5,"lease_wait_s":30,"excluded_agents":[]}"#;
+        assert!(serde_json::from_str::<Config>(json).is_err());
     }
 
     #[test]

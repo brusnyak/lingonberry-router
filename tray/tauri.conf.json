@@ -4,16 +4,25 @@
   "version": "0.1.0",
   "identifier": "dev.lingonberry.router",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "npx vite --port 3000 --strictPort",
     "devUrl": "http://127.0.0.1:3000",
     "beforeBuildCommand": "npm run build:web",
     "frontendDist": "../dist"
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "category": "DeveloperTool",
+    "shortDescription": "Local AI agent router menu bar app",
+    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"],
+    "externalBin": ["binaries/lingonberry-core"]
   },
   "app": {
     "macOSPrivateApi": true,
     "windows": [
       {
         "label": "popover",
+        "url": "index.html#popover",
         "title": "Lingonberry Router",
         "width": 780,
         "height": 660,

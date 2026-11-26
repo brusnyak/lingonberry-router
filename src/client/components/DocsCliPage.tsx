@@ -10,7 +10,7 @@ const CLI_ROWS = [
   { cmd: 'doctor', desc: 'Read-only health check outputting JSON; exits 1 on invalid config or missing state.' },
   { cmd: 'discover', desc: 'Scan PATH for agent CLIs, env key names, providers, workers, and shared skill dirs.' },
   { cmd: 'route "<prompt>"', desc: 'Cook prompt with matching skill/command/hook and print cryptographic receipt; runs nothing.' },
-  { cmd: 'run "<prompt>" [--worker <id>] [--caller <name>] [--gate <cmd>] [--worktree]', desc: 'Lease a provider-scoped key slot, execute CLI or API worker, and verify gate.' },
+  { cmd: 'run "<prompt>" [--worker <id>] [--caller <name>] [--gate <cmd>] [--worktree]', desc: 'Lease a provider-scoped key, execute CLI or API worker, and verify gate.' },
   { cmd: 'fanout "<p1>" "<p2>" …', desc: 'Dispatch one run per prompt round-robin over discovered workers.' },
   { cmd: 'serve [127.0.0.1:8799]', desc: 'Start the loopback HTTP API, SQLite WAL store, and background cron watchdog.' },
   { cmd: 'self-config [--apply]', desc: 'Inspect or apply global-first skill/constitution files plus 2-line light pointers.' },
@@ -18,10 +18,10 @@ const CLI_ROWS = [
 ];
 
 const HTTP_ROWS = [
-  { method: 'GET', path: '/snapshot', desc: 'Running workers, sessions, key slots, cron jobs & live OS cron PIDs, overview, CPU/RAM metrics.' },
+  { method: 'GET', path: '/snapshot', desc: 'Running workers, sessions, keys, cron jobs & live OS cron PIDs, overview, CPU/RAM metrics.' },
   { method: 'GET', path: '/keys', desc: 'Key-slot status including active inflight, cooldown countdown, and RPM cap.' },
-  { method: 'POST', path: '/api/keys/{name}/rpm', desc: 'Live-adjust per-provider RPM ceiling (5..300) by provider or key slot name.' },
-  { method: 'POST', path: '/keys/{name}/reset', desc: 'Clear active cooldown lock on a key slot immediately.' },
+  { method: 'POST', path: '/api/keys/{name}/rpm', desc: 'Live-adjust per-provider RPM ceiling (5..300) by provider or key name.' },
+  { method: 'POST', path: '/keys/{name}/reset', desc: 'Clear active cooldown lock on a key immediately.' },
   { method: 'POST', path: '/kill/{pid}', desc: 'Send SIGTERM to one live router-owned worker process group; refuses external PIDs.' },
   { method: 'GET', path: '/api/jobs', desc: 'List crontab, launchd, systemd, schtasks & router jobs plus live OS cron PIDs.' },
   { method: 'POST', path: '/api/jobs/rescan', desc: 'Rescan host OS schedules and matching live cron child processes.' },
@@ -34,8 +34,8 @@ const HTTP_ROWS = [
 const CONFIG_KEYS = [
   { key: 'port', def: '8799', meaning: 'Loopback port for serve when no bind address is passed.' },
   { key: 'default_worker', def: 'pi', meaning: 'Worker used when a run names none (validated routable).' },
-  { key: 'max_inflight_per_key', def: '3', meaning: 'Concurrent runs allowed per key slot.' },
-  { key: 'rpm_per_key', def: '40', meaning: 'Calls allowed per key slot per 60 seconds (live adjustable).' },
+  { key: 'max_inflight_per_key', def: '3', meaning: 'Concurrent runs allowed per key.' },
+  { key: 'rpm_per_key', def: '40', meaning: 'Calls allowed per key per 60 seconds (live adjustable).' },
   { key: 'cooldown_s', def: '60', meaning: 'Rest seconds placed after a rate-limit or truncated failure.' },
   { key: 'lease_wait_s', def: '30', meaning: 'Seconds a dispatch waits for a free key before failing cleanly.' },
   { key: 'excluded_agents', def: '["cline"]', meaning: 'Discovered agents that stay visible but are never routed to.' },

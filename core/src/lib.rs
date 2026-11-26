@@ -2,6 +2,7 @@ pub mod agents;
 pub mod config;
 pub mod cron;
 pub mod discovery;
+pub mod stores;
 pub mod events;
 pub mod registry;
 pub mod server;

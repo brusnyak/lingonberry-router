@@ -200,7 +200,7 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
       time: new Date().toTimeString().slice(0, 8),
       caller: 'codex',
       worker: 'groq:GROQ_API_KEY',
-      detail: 'leased key slot · 3 max inflight / 40 RPM',
+      detail: 'leased key · 3 max inflight / 40 RPM',
     },
   ]);
 

@@ -86,9 +86,14 @@ export default function App() {
     }, 2400);
   }, []);
 
+  const [coreOffline, setCoreOffline] = useState(false);
   const refresh = useCallback(async () => {
-    const next = await loadRouterState();
-    setState(next);
+    try {
+      setState(await loadRouterState());
+      setCoreOffline(false);
+    } catch {
+      setCoreOffline(true);
+    }
   }, []);
 
   useEffect(() => {
@@ -156,8 +161,37 @@ export default function App() {
 
   if (!state || !snap) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[#f4f5f7] dark:bg-[#090a0d] text-xs font-mono text-zinc-500 dark:text-slate-400">
-        Connecting to Lingonberry Router…
+      <div className="min-h-screen flex flex-col items-center justify-center gap-2 bg-[#f4f5f7] dark:bg-[#090a0d] text-xs font-mono text-zinc-500 dark:text-slate-400 p-6 text-center">
+        {coreOffline ? (
+          <>
+            <span className="text-zinc-800 dark:text-slate-200">Core offline</span>
+            <span>Nothing is listening on 127.0.0.1:8799. Quit and reopen the app to start it.</span>
+          </>
+        ) : (
+          'Connecting to Lingonberry Router…'
+        )}
+      </div>
+    );
+  }
+
+  // Tray popover window (tray/tauri.conf.json loads index.html#popover): the giga menu bar only.
+  if (window.location.hash === '#popover') {
+    return (
+      <div className="min-h-screen p-2 bg-transparent">
+        <MenuBarGiga
+          state={state}
+          busy={busy}
+          onRefresh={() => runAction(() => triggerRescan())}
+          onRoute={(p) => runAction(() => routeDryRun(p))}
+          onRun={(p) => runAction(() => dispatchTestRun(p))}
+          onFanout={(p) => runAction(() => dispatchFanoutRun(p))}
+          onKillWorker={(pid) => runAction(() => killWorkerPid(pid))}
+          onResetKey={(name) => runAction(() => resetKeyCooldown(name))}
+          onAdjustProviderRpm={(prov, rpm) => runAction(() => setProviderRpm(prov, rpm))}
+          onToggleJob={(name) => runAction(() => toggleCronJob(name))}
+          onRunJob={(name) => runAction(() => triggerCronJob(name))}
+          onHealJob={(name) => runAction(() => healCronJob(name))}
+        />
       </div>
     );
   }
@@ -208,7 +242,7 @@ export default function App() {
 
   const quickRoutes = [
     { path: 'GET /snapshot', target: `${snap.workers_live.length} active · ${snap.jobs.length} jobs`, meta: '127.0.0.1:8799' },
-    { path: 'GET /keys', target: `${healthyKeysCount}/${snap.workers.length} key slots healthy`, meta: 'RAII KeyPool' },
+    { path: 'GET /keys', target: `${healthyKeysCount}/${snap.workers.length} keys healthy`, meta: 'RAII KeyPool' },
     { path: 'GET /api/jobs', target: `${snap.cron_live.length} live OS cron PIDs`, meta: 'crontab/launchd/systemd' },
     { path: 'POST /api/rescan', target: `${state.discovery.agents.length} CLIs · ${state.discovery.library_dirs.length} skill dirs`, meta: 'discovery' },
   ].filter(
@@ -923,7 +957,7 @@ export default function App() {
               </div>
 
               <div className="bg-[#f8f9fb] dark:bg-[#06070a]/80 p-3 rounded-xl border border-zinc-200 dark:border-white/[0.06]">
-                <span className="text-[10px] font-mono text-zinc-500">Healthy Key Slots</span>
+                <span className="text-[10px] font-mono text-zinc-500">Healthy Keys</span>
                 <div className="text-[18px] font-mono font-semibold text-amber-600 dark:text-[#fabb60] mt-0.5 tabular-nums">
                   {healthyKeysCount}/{snap.workers.length}
                 </div>
@@ -1066,13 +1100,13 @@ export default function App() {
                     <strong className="text-zinc-900 dark:text-white">
                       Provider-Scoped KeyPool &amp; RAII LeaseGuard:
                     </strong>{' '}
-                    Key slots are isolated per provider (NVIDIA NIM, Groq, Gemini). Each slot
+                    Keys are isolated per provider (NVIDIA NIM, Groq, Gemini). Each slot
                     enforces 3 concurrent runs and 40 calls/min by default, adjustable live via{' '}
                     <code>POST /api/keys/:name/rpm</code>.
                   </p>
                   <p className="text-zinc-500 dark:text-zinc-400">
                     HTTP 429 bursts or truncated outputs place the failing key on cooldown and
-                    automatically retry on a healthy sibling slot via{' '}
+                    automatically retry on a healthy other key via{' '}
                     <code>find_fallback_worker</code>. Panics or cancellations always release the
                     slot through RAII <code>Drop</code>.
                   </p>

@@ -56,7 +56,7 @@ class StaticSandbox {
       {
         id: 'pi:NIM_1',
         agent: 'pi',
-        key_slot: 'NIM_1',
+        key_name: 'NIM_1',
         provider: 'nim',
         base_url: 'https://integrate.api.nvidia.com/v1',
         model: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
@@ -66,7 +66,7 @@ class StaticSandbox {
       {
         id: 'pi:NIM_2',
         agent: 'pi',
-        key_slot: 'NIM_2',
+        key_name: 'NIM_2',
         provider: 'nim',
         base_url: 'https://integrate.api.nvidia.com/v1',
         model: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
@@ -76,7 +76,7 @@ class StaticSandbox {
       {
         id: 'groq:GROQ_API_KEY',
         agent: 'groq',
-        key_slot: 'GROQ_API_KEY',
+        key_name: 'GROQ_API_KEY',
         provider: 'groq',
         base_url: 'https://api.groq.com/openai/v1',
         model: 'llama-3.3-70b-versatile',
@@ -86,7 +86,7 @@ class StaticSandbox {
       {
         id: 'gemini:GEMINI_API_KEY',
         agent: 'gemini',
-        key_slot: 'GEMINI_API_KEY',
+        key_name: 'GEMINI_API_KEY',
         provider: 'gemini',
         base_url: 'https://generativelanguage.googleapis.com/v1beta/openai',
         model: 'gemini-2.5-flash',
@@ -96,7 +96,7 @@ class StaticSandbox {
       {
         id: 'claude',
         agent: 'claude',
-        key_slot: null,
+        key_name: null,
         provider: 'claude',
         base_url: null,
         model: 'claude-sonnet-4',
@@ -106,7 +106,7 @@ class StaticSandbox {
       {
         id: 'codex',
         agent: 'codex',
-        key_slot: null,
+        key_name: null,
         provider: 'codex',
         base_url: null,
         model: 'gpt-5-codex',
@@ -148,7 +148,7 @@ class StaticSandbox {
       rc: 0,
       paused: false,
       next_in_s: 190,
-      prompt: 'Verify config, key-slot cooldowns, and worker reachability',
+      prompt: 'Verify config, key cooldowns, and worker reachability',
       health: 'healthy',
       running_pid: null,
       crash_count: 0,
@@ -239,9 +239,9 @@ class StaticSandbox {
   constructor() {
     const baseTs = Date.now() / 1000 - 120;
     const initialCook: CookedPromptInfo = {
-      raw_prompt: 'audit auth middleware for cookie drops and verify with tests',
+      raw_prompt: 'sample: summarise the latest worker logs',
       cooked_prompt:
-        '[Constitution: global-agentic-skills · systematic-debugging]\n[Hook: pre-apply-diff-preview · Gate: test-suite-exit-0]\nObjective: audit auth middleware for cookie drops and verify with tests',
+        '[Constitution: global-agentic-skills · systematic-debugging]\n[Hook: pre-apply-diff-preview · Gate: test-suite-exit-0]\nObjective: sample: summarise the latest worker logs',
       task_class: 'debug_fix',
       selected_skill: 'systematic-debugging',
       selected_command: 'lingonberry-core run --worktree --gate test',
@@ -285,10 +285,10 @@ class StaticSandbox {
       created_at: new Date(Date.now() - 45_000).toISOString(),
       worker: 'pi:NIM_1',
       caller: 'claude',
-      key_slot: 'NIM_1',
+      key_name: 'NIM_1',
       model: 'nvidia/nemotron-3.5-super-vl-120b-a12b',
       provider: 'nim',
-      prompt: 'audit auth middleware for cookie drops and verify with tests',
+      prompt: 'sample: summarise the latest worker logs',
       gate: 'test-suite-exit-0',
       state: 'done',
       pid: 41982,
@@ -320,7 +320,7 @@ class StaticSandbox {
           ts: baseTs + 0.9,
           stage: 'routed',
           title: 'Router selected pi:NIM_1',
-          detail: 'Leased key slot NIM_1 (nim)',
+          detail: 'Leased key NIM_1 (nim)',
           tone: 'route',
         },
         {
@@ -342,7 +342,7 @@ class StaticSandbox {
         pid: r.pid ?? 0,
         worker: r.worker,
         caller: r.caller,
-        key: r.key_slot,
+        key: r.key_name,
         model: r.model,
         provider: r.provider,
         run_id: r.id,
@@ -403,7 +403,7 @@ class StaticSandbox {
         prompt: r.prompt,
         worker: r.worker,
         caller: r.caller,
-        key: r.key_slot,
+        key: r.key_name,
         state: r.state,
         duration_s:
           typeof r.elapsed_ms === 'number'
@@ -470,7 +470,7 @@ class StaticSandbox {
         scope: 'global' as const,
         path: '~/.lingonberry/CONSTITUTION.md',
         reason:
-          'Defines prompt-cooking rules, destructive-keyword gates, and key-slot isolation across all callers.',
+          'Defines prompt-cooking rules, destructive-keyword gates, and key isolation across all callers.',
         snippet:
           '# Lingonberry Constitution Pointer\nUse `ROUTER_CALLER=<agent>` and loopback `127.0.0.1:8799`.',
       },
@@ -557,7 +557,7 @@ class StaticSandbox {
       this.discovery.workers.find((w) => w.id === 'pi:NIM_1') ??
       this.discovery.workers[0];
 
-    const keySlot = chosen.key_slot ?? null;
+    const keyName = chosen.key_name ?? null;
     const receipt: Receipt = {
       receipt_id: `rcpt-${Math.random().toString(16).slice(2, 10)}`,
       context_hash: Math.random().toString(16).slice(2, 18),
@@ -584,8 +584,8 @@ class StaticSandbox {
 
     const runId = Math.random().toString(16).slice(2, 10);
     const pid = this.nextPid++;
-    if (keySlot) {
-      this.inflightByKey.set(keySlot, (this.inflightByKey.get(keySlot) ?? 0) + 1);
+    if (keyName) {
+      this.inflightByKey.set(keyName, (this.inflightByKey.get(keyName) ?? 0) + 1);
     }
 
     const steps: SessionStep[] = [
@@ -607,7 +607,7 @@ class StaticSandbox {
         ts: now + 0.35,
         stage: 'routed',
         title: `Router selected ${chosen.id}`,
-        detail: keySlot ? `Leased key slot ${keySlot}` : `Local CLI (${chosen.agent})`,
+        detail: keyName ? `Leased key ${keyName}` : `Local CLI (${chosen.agent})`,
         tone: 'active',
       },
     ];
@@ -617,7 +617,7 @@ class StaticSandbox {
       created_at: new Date().toISOString(),
       worker: chosen.id,
       caller,
-      key_slot: keySlot,
+      key_name: keyName,
       model: chosen.model,
       provider: chosen.provider,
       prompt,
@@ -641,11 +641,11 @@ class StaticSandbox {
       setTimeout(() => {
         const target = this.runs.find((r) => r.id === runId);
         if (!target || target.state !== 'running') return;
-        const failedKey = target.key_slot ?? 'NIM_1';
+        const failedKey = target.key_name ?? 'NIM_1';
         this.inflightByKey.set(failedKey, Math.max(0, (this.inflightByKey.get(failedKey) ?? 1) - 1));
         this.coolingUntil.set(failedKey, Date.now() / 1000 + 20);
-        const fbWorker = this.discovery.workers.find((w) => w.key_slot && w.key_slot !== failedKey) ?? chosen;
-        const fbKey = fbWorker.key_slot ?? 'NIM_2';
+        const fbWorker = this.discovery.workers.find((w) => w.key_name && w.key_name !== failedKey) ?? chosen;
+        const fbKey = fbWorker.key_name ?? 'NIM_2';
         this.inflightByKey.set(fbKey, (this.inflightByKey.get(fbKey) ?? 0) + 1);
         target.steps?.push({
           ts: Date.now() / 1000,
@@ -658,7 +658,7 @@ class StaticSandbox {
           tone: 'warn',
         });
         target.worker = fbWorker.id;
-        target.key_slot = fbKey;
+        target.key_name = fbKey;
         target.failover_from = failedKey;
         setTimeout(() => {
           const latest = this.runs.find((r) => r.id === runId);
@@ -691,7 +691,7 @@ class StaticSandbox {
       target.gate_passed = true;
       target.tokens_in = 840;
       target.tokens_out = 510;
-      target.output = `Executed on ${chosen.id}${keySlot ? ` (${keySlot})` : ''} · ${cooked.selected_skill} · gate passed.`;
+      target.output = `Executed on ${chosen.id}${keyName ? ` (${keyName})` : ''} · ${cooked.selected_skill} · gate passed.`;
       target.steps?.push({
         ts: Date.now() / 1000,
         stage: 'gate',
@@ -699,9 +699,9 @@ class StaticSandbox {
         detail: `Result verified · ${target.tokens_in} in / ${target.tokens_out} out`,
         tone: 'done',
       });
-      if (keySlot) {
-        this.inflightByKey.set(keySlot, Math.max(0, (this.inflightByKey.get(keySlot) ?? 1) - 1));
-        this.okByKey.set(keySlot, (this.okByKey.get(keySlot) ?? 0) + 1);
+      if (keyName) {
+        this.inflightByKey.set(keyName, Math.max(0, (this.inflightByKey.get(keyName) ?? 1) - 1));
+        this.okByKey.set(keyName, (this.okByKey.get(keyName) ?? 0) + 1);
       }
     }, 3200);
   }
@@ -733,10 +733,10 @@ class StaticSandbox {
       detail: 'SIGTERM issued via router · lease released',
       tone: 'warn',
     });
-    if (target.key_slot) {
+    if (target.key_name) {
       this.inflightByKey.set(
-        target.key_slot,
-        Math.max(0, (this.inflightByKey.get(target.key_slot) ?? 1) - 1)
+        target.key_name,
+        Math.max(0, (this.inflightByKey.get(target.key_name) ?? 1) - 1)
       );
     }
   }
@@ -845,8 +845,12 @@ class StaticSandbox {
 const sandbox = new StaticSandbox();
 let detectedMode: 'live-api' | 'static-preview' | null = null;
 
-async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(url, {
+// Inside the Tauri tray the page is served from the app origin, so the core must be addressed explicitly.
+const inTray = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+const CORE_BASE = inTray ? 'http://127.0.0.1:8799' : '';
+
+async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const res = await fetch(`${CORE_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...init,
   });
@@ -871,7 +875,9 @@ export async function loadRouterState(): Promise<RouterRuntimeState> {
     ]);
     detectedMode = 'live-api';
     return { mode: 'live-api', snapshot, discovery, receipts, selfConfig, capabilities };
-  } catch {
+  } catch (err) {
+    // The tray must never show sample data as if it were the machine's state.
+    if (inTray) throw new Error('core offline');
     detectedMode = 'static-preview';
     return sandbox.getState();
   }

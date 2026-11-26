@@ -44,7 +44,7 @@ export interface Run {
   created_at: string;
   worker: string;
   caller: string | null;
-  key_slot: string | null;
+  key_name: string | null;
   model: string | null;
   provider: string | null;
   prompt: string;
@@ -115,6 +115,7 @@ export interface SessionRow {
   reason: string | null;
   output: string | null;
   receipt_id?: string | null;
+  cooked?: CookedPromptInfo | null;
   steps?: SessionStep[];
   fanout_group?: string | null;
   failover_from?: string | null;
@@ -168,6 +169,9 @@ export interface SystemInfo {
   ram_total_gb: number | null;
   disk_used_gb: number | null;
   disk_total_gb: number | null;
+  /** This app only: core plus tray. CPU in percent of one core, RAM in GB. */
+  app_cpu_pct?: number | null;
+  app_ram_gb?: number | null;
 }
 
 export interface TelemetryPoint {
@@ -226,7 +230,7 @@ export interface Receipt {
 export interface DiscoveredWorker {
   id: string;
   agent: string;
-  key_slot: string | null;
+  key_name: string | null;
   provider: string;
   base_url: string | null;
   model: string | null;

@@ -10,44 +10,46 @@ const AGENT_BINS: &[&str] = &[
     "crush", "qwen",
 ];
 
-const PROVIDER_PREFIXES: &[&str] = &[
-    "NIM",
-    "NVIDIA_API_KEY",
-    "GROQ_API_KEY",
-    "OPENROUTER_API_KEY",
-    "ANTHROPIC_API_KEY",
-    "OPENAI_API_KEY",
-    "GEMINI_API_KEY",
-    "MISTRAL_API_KEY",
-    "DEEPSEEK_API_KEY",
-    "TOGETHER_API_KEY",
-    "FIREWORKS_API_KEY",
-    "CEREBRAS_API_KEY",
-    "XAI_API_KEY",
-];
-
+/// Env var name -> provider id. Explicit names first, then any `<NAME>_API_KEY` becomes a
+/// provider `<name>` (shown, but dispatched only when a base URL is known). NIM_n and NVIDIA_API_KEY map to nim.
 const WRITE_AGENTS: &[&str] = &[
     "claude", "codex", "opencode", "kilo", "cline", "goose", "omp",
 ];
 
-pub fn provider_id(prefix: &str) -> &'static str {
-    if prefix.starts_with("NIM") || prefix == "NVIDIA_API_KEY" {
-        return "nim";
+pub fn provider_for_env(name: &str) -> Option<String> {
+    let n = name.trim().to_ascii_uppercase();
+    if n == "NVIDIA_API_KEY" || (n.starts_with("NIM_") && n.len() > 4) {
+        return Some("nim".into());
     }
-    match prefix {
-        "GROQ_API_KEY" => "groq",
-        "OPENROUTER_API_KEY" => "openrouter",
-        "ANTHROPIC_API_KEY" => "anthropic",
-        "OPENAI_API_KEY" => "openai",
-        "GEMINI_API_KEY" => "gemini",
-        "MISTRAL_API_KEY" => "mistral",
-        "DEEPSEEK_API_KEY" => "deepseek",
-        "TOGETHER_API_KEY" => "together",
-        "FIREWORKS_API_KEY" => "fireworks",
-        "CEREBRAS_API_KEY" => "cerebras",
-        "XAI_API_KEY" => "xai",
-        _ => "custom",
+    let exact = [
+        ("GROQ_API_KEY", "groq"),
+        ("XAI_API_KEY", "xai"),
+        ("GROK_API_KEY", "xai"),
+        ("GOOGLE_API_KEY", "google"),
+        ("GEMINI_API_KEY", "google"),
+        ("GOOGLE_STUDIO_API", "google"),
+        ("GOOGLE_AI_STUDIO_API_KEY", "google"),
+        ("OPENROUTER_API_KEY", "openrouter"),
+        ("MOONSHOT_API_KEY", "kimi"),
+        ("KIMI_API_KEY", "kimi"),
+        ("QWEN_API_KEY", "qwen"),
+        ("DASHSCOPE_API_KEY", "qwen"),
+        ("DEEPSEEK_API_KEY", "deepseek"),
+        ("MISTRAL_API_KEY", "mistral"),
+        ("OPENAI_API_KEY", "openai"),
+        ("ANTHROPIC_API_KEY", "anthropic"),
+        ("TOGETHER_API_KEY", "together"),
+        ("FIREWORKS_API_KEY", "fireworks"),
+        ("CEREBRAS_API_KEY", "cerebras"),
+    ];
+    if let Some((_, p)) = exact.iter().find(|(k, _)| *k == n) {
+        return Some((*p).into());
     }
+    let suffix = "_API_KEY";
+    if n.ends_with(suffix) && n.len() > suffix.len() {
+        return Some(n[..n.len() - suffix.len()].to_ascii_lowercase());
+    }
+    None
 }
 
 fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
@@ -65,7 +67,7 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
         "groq" => Some((
             "https://api.groq.com/openai/v1",
             Some("openai"),
-            Some("llama-3.3-70b-versatile"),
+            Some("llama-3.1-8b-instant"),
         )),
         "anthropic" => Some((
             "https://api.anthropic.com/v1",
@@ -87,10 +89,20 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
         "fireworks" => Some(("https://api.fireworks.ai/inference/v1", Some("openai"), None)),
         "cerebras" => Some(("https://api.cerebras.ai/v1", Some("openai"), None)),
         "xai" => Some(("https://api.x.ai/v1", Some("openai"), Some("grok-3"))),
-        "gemini" => Some((
+        "google" => Some((
             "https://generativelanguage.googleapis.com/v1beta/openai",
             Some("openai"),
             Some("gemini-2.5-flash"),
+        )),
+        "kimi" => Some((
+            "https://api.moonshot.ai/v1",
+            Some("openai"),
+            Some("kimi-k2-0905-preview"),
+        )),
+        "qwen" => Some((
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            Some("openai"),
+            Some("qwen-plus"),
         )),
         _ => None,
     }
@@ -106,6 +118,11 @@ pub fn env_files(home: &Path) -> Vec<PathBuf> {
 /// Resolves a key value at dispatch time from process env or ~/.env / ~/.config/lingonberry/env.
 /// Key values are NEVER logged or serialized into snapshots.
 pub fn resolve_key_value(slot: &str) -> Option<String> {
+    if let Some(rest) = slot.strip_prefix("store:") {
+        let (source, name) = rest.split_once('|')?;
+        let home = dirs::home_dir()?;
+        return crate::stores::resolve_store_value(&home, source, name);
+    }
     if let Ok(val) = std::env::var(slot) {
         if !val.trim().is_empty() {
             return Some(val);
@@ -163,6 +180,13 @@ pub fn scan_discovery() -> DiscoveryData {
 
     let mut keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut seen = BTreeSet::new();
+    let mut take = |name: &str, keys: &mut BTreeMap<String, Vec<String>>| {
+        if let Some(prov) = provider_for_env(name) {
+            if seen.insert(name.to_string()) {
+                keys.entry(prov).or_default().push(name.to_string());
+            }
+        }
+    };
     if let Some(home) = dirs::home_dir() {
         for file in env_files(&home) {
             if let Ok(content) = fs::read_to_string(file) {
@@ -176,27 +200,34 @@ pub fn scan_discovery() -> DiscoveryData {
                             continue;
                         }
                         let name = k.trim().strip_prefix("export ").unwrap_or(k.trim()).trim();
-                        for prefix in PROVIDER_PREFIXES {
-                            if name.starts_with(prefix) && seen.insert(name.to_string()) {
-                                let prov = provider_id(prefix).to_string();
-                                keys.entry(prov).or_default().push(name.to_string());
-                            }
-                        }
+                        take(name, &mut keys);
                     }
                 }
             }
         }
     }
-
     for (name, val) in std::env::vars() {
-        if val.trim().is_empty() {
+        if !val.trim().is_empty() {
+            take(&name, &mut keys);
+        }
+    }
+
+    // Keys from other agents' stores become dispatchable as `store:<file>|<name>` slots.
+    // Env files are skipped here: the env scan above already covers them.
+    let store_keys = dirs::home_dir()
+        .map(|h| crate::stores::scan_stores(&h))
+        .unwrap_or_default();
+    for sk in &store_keys {
+        if sk.source == ".env" || sk.source == ".config/lingonberry/env" {
             continue;
         }
-        for prefix in PROVIDER_PREFIXES {
-            if name.starts_with(prefix) && seen.insert(name.clone()) {
-                let prov = provider_id(prefix).to_string();
-                keys.entry(prov).or_default().push(name.clone());
-            }
+        if known_provider(&sk.provider).is_none() {
+            continue;
+        }
+        let slot = format!("store:{}|{}", sk.source, sk.name);
+        let list = keys.entry(sk.provider.clone()).or_default();
+        if !list.contains(&slot) {
+            list.push(slot);
         }
     }
 
@@ -278,7 +309,35 @@ pub fn scan_discovery() -> DiscoveryData {
         ssh_hosts,
         git_projects,
         browsers: Vec::new(),
+        stores: store_keys,
     }
+}
+
+/// The core is often started by launchd or Finder, which gives a minimal PATH that hides
+/// the agent CLIs installed under the user's tool directories. Add the usual ones once at startup.
+pub fn ensure_tool_path() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut parts: Vec<String> = std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    let extra = [
+        format!("{home}/.local/bin"),
+        format!("{home}/.cargo/bin"),
+        format!("{home}/.npm-global/bin"),
+        format!("{home}/.bun/bin"),
+        "/opt/homebrew/bin".to_string(),
+        "/opt/homebrew/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+    ];
+    for dir in extra {
+        if !parts.contains(&dir) {
+            parts.push(dir);
+        }
+    }
+    std::env::set_var("PATH", parts.join(":"));
 }
 
 pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
@@ -289,7 +348,7 @@ pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
         out.push(DiscoveredWorker {
             id: "pi".to_string(),
             agent: "pi".to_string(),
-            key_slot: None,
+            key_name: None,
             provider: "nim".to_string(),
             base_url: d.providers.get("nim").map(|p| p.base_url.clone()),
             model: Some(PI_NIM_MODEL.to_string()),
@@ -300,11 +359,12 @@ pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
 
     for agent in &d.agents {
         if agent.id == "pi" {
-            for key in &nim_keys {
+            // pi reads keys from environment variable names, so store-file slots are not offered to it
+            for key in nim_keys.iter().filter(|k| !k.starts_with("store:")) {
                 out.push(DiscoveredWorker {
                     id: format!("pi:{key}"),
                     agent: "pi".to_string(),
-                    key_slot: Some(key.clone()),
+                    key_name: Some(key.clone()),
                     provider: "nim".to_string(),
                     base_url: d.providers.get("nim").map(|p| p.base_url.clone()),
                     model: Some(PI_NIM_MODEL.to_string()),
@@ -324,9 +384,9 @@ pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
             out.push(DiscoveredWorker {
                 id: format!("{prov}:{key}"),
                 agent: prov.clone(),
-                key_slot: Some(key.clone()),
+                key_name: Some(key.clone()),
                 provider: prov.clone(),
-                base_url: d.providers.get(prov).map(|p| p.base_url.clone()),
+                base_url: d.providers.get(prov).map(|p| p.base_url.clone()).filter(|u| !u.is_empty()),
                 model: default_model.clone(),
                 write_access: true,
                 path: None,
@@ -339,7 +399,7 @@ pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
             out.push(DiscoveredWorker {
                 id: agent.id.clone(),
                 agent: agent.id.clone(),
-                key_slot: None,
+                key_name: None,
                 provider: agent.id.clone(),
                 base_url: None,
                 model: None,
@@ -353,7 +413,7 @@ pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
         out.push(DiscoveredWorker {
             id: format!("nim-chat:{key}"),
             agent: "nim-chat".to_string(),
-            key_slot: Some(key.clone()),
+            key_name: Some(key.clone()),
             provider: "nim".to_string(),
             base_url: d.providers.get("nim").map(|p| p.base_url.clone()),
             model: Some(PI_NIM_MODEL.to_string()),
@@ -370,10 +430,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn provider_mapping_keeps_nim_and_gemini_isolated() {
-        assert_eq!(provider_id("NIM_1"), "nim");
-        assert_eq!(provider_id("NVIDIA_API_KEY"), "nim");
-        assert_eq!(provider_id("GEMINI_API_KEY"), "gemini");
-        assert_eq!(provider_id("GROQ_API_KEY"), "groq");
+    fn provider_mapping_covers_named_and_generic_keys() {
+        assert_eq!(provider_for_env("NIM_1").as_deref(), Some("nim"));
+        assert_eq!(provider_for_env("NVIDIA_API_KEY").as_deref(), Some("nim"));
+        assert_eq!(provider_for_env("GOOGLE_STUDIO_API").as_deref(), Some("google"));
+        assert_eq!(provider_for_env("GEMINI_API_KEY").as_deref(), Some("google"));
+        assert_eq!(provider_for_env("GROQ_API_KEY").as_deref(), Some("groq"));
+        assert_eq!(provider_for_env("OPENROUTER_API_KEY").as_deref(), Some("openrouter"));
+        assert_eq!(provider_for_env("XAI_API_KEY").as_deref(), Some("xai"));
+        assert_eq!(provider_for_env("MOONSHOT_API_KEY").as_deref(), Some("kimi"));
+        assert_eq!(provider_for_env("QWEN_API_KEY").as_deref(), Some("qwen"));
+        assert_eq!(provider_for_env("FOO_API_KEY").as_deref(), Some("foo"));
+        assert_eq!(provider_for_env("NIMBUS_TOKEN"), None);
+        assert_eq!(provider_for_env("PATH"), None);
     }
 }

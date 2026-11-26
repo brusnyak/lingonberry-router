@@ -48,7 +48,7 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 worker TEXT NOT NULL,
                 caller TEXT,
-                key_slot TEXT,
+                key_name TEXT,
                 model TEXT,
                 provider TEXT,
                 prompt TEXT NOT NULL,
@@ -70,6 +70,15 @@ impl SqliteStore {
             );
             ",
         )?;
+        // Migration: insert_run writes `key_name`, but DBs created before the rename have `key_slot` only.
+        // The insert failed silently (let _ =), so no run was ever persisted and `run` waited forever.
+        // Additive and non-destructive: old binaries keep writing key_slot; payload_json stays authoritative.
+        let has_key_name = conn
+            .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'key_name'")?
+            .exists([])?;
+        if !has_key_name {
+            conn.execute_batch("ALTER TABLE runs ADD COLUMN key_name TEXT;")?;
+        }
 
         let now = now_sec();
         let mut jobs = BTreeMap::new();
@@ -103,7 +112,7 @@ impl SqliteStore {
                 rc: Some(0),
                 paused: Some(false),
                 next_in_s: Some(160),
-                prompt: Some("Verify config, key-slot cooldowns, and worker reachability".into()),
+                prompt: Some("Verify config, key cooldowns, and worker reachability".into()),
                 health: "healthy".into(),
                 running_pid: None,
                 crash_count: 0,
@@ -152,7 +161,7 @@ impl SqliteStore {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT OR REPLACE INTO runs (
-                id, created_at, worker, caller, key_slot, model, provider,
+                id, created_at, worker, caller, key_name, model, provider,
                 prompt, gate, state, pid, elapsed_ms, gate_passed, error,
                 output, task_class, receipt_id, payload_json
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
@@ -161,7 +170,7 @@ impl SqliteStore {
                 run.created_at,
                 run.worker,
                 run.caller,
-                run.key_slot,
+                run.key_name,
                 run.model,
                 run.provider,
                 run.prompt,
@@ -217,14 +226,14 @@ impl SqliteStore {
         &self,
         id: &str,
         worker: String,
-        key_slot: Option<String>,
+        key_name: Option<String>,
         provider: Option<String>,
         model: Option<String>,
         failover_from: Option<String>,
     ) {
         if let Some(mut run) = self.get_run(id) {
             run.worker = worker;
-            run.key_slot = key_slot;
+            run.key_name = key_name;
             run.provider = provider;
             run.model = model;
             run.failover_from = failover_from;
@@ -456,7 +465,7 @@ mod tests {
             created_at: "2026-11-25T07:00:00Z".into(),
             worker: "pi:NIM_1".into(),
             caller: Some("claude".into()),
-            key_slot: Some("NIM_1".into()),
+            key_name: Some("NIM_1".into()),
             model: None,
             provider: Some("nim".into()),
             prompt: "test prompt".into(),

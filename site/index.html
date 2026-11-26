@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lingonberry Router: local router for AI agents</title>
+<meta name="description" content="A local router that accepts work from your AI agents, picks a worker, checks the result, and records a receipt. macOS build. Source on GitHub." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --bg: #090a0d;
+    --surface: #0e1017;
+    --card: #11131b;
+    --line: rgba(255,255,255,.08);
+    --text: #f1f2f6;
+    --muted: #9ba1b4;
+    --dim: #6b7085;
+    --amber: #fabb60;
+    --emerald: #59e8ab;
+    --rose: #fb7185;
+    --sky: #7dd3fc;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); }
+  body { font-family: 'Geist', -apple-system, BlinkMacSystemFont, sans-serif; line-height: 1.55; -webkit-font-smoothing: antialiased; }
+  ::selection { background: rgba(250,187,96,.28); }
+  a { color: var(--amber); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
+  code, pre, .mono { font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 24px; }
+
+  header.top { position: sticky; top: 0; z-index: 5; background: rgba(9,10,13,.86); backdrop-filter: blur(10px); border-bottom: 1px solid var(--line); }
+  header.top .wrap { display: flex; align-items: center; justify-content: space-between; height: 56px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -.01em; color: var(--text); text-decoration: none; }
+  .mark { width: 22px; height: 22px; border-radius: 6px; border: 1px solid rgba(89,232,171,.35); display: grid; place-items: center; }
+  .mark i { width: 6px; height: 6px; border-radius: 50%; background: var(--emerald); }
+  nav a { color: var(--muted); text-decoration: none; font-size: 14px; margin-left: 22px; }
+  nav a:hover { color: var(--text); }
+
+  .hero { padding: 88px 0 72px; display: grid; grid-template-columns: 1.05fr 1fr; gap: 56px; align-items: center; }
+  h1 { font-size: 46px; line-height: 1.08; letter-spacing: -.035em; margin: 0 0 18px; font-weight: 600; }
+  .lede { color: var(--muted); font-size: 17px; max-width: 520px; margin: 0 0 28px; }
+  .cmd { display: flex; align-items: center; justify-content: space-between; gap: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font-size: 14px; max-width: 520px; }
+  .cmd code { color: var(--text); overflow-x: auto; white-space: nowrap; }
+  .cmd button { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 4px 9px; font: 12px 'JetBrains Mono', monospace; cursor: pointer; flex-shrink: 0; }
+  .cmd button:hover { color: var(--text); }
+  .meta { color: var(--dim); font-size: 13px; margin-top: 14px; }
+
+  .flow { background: var(--surface); border: 1px solid var(--line); border-radius: 16px; padding: 22px; }
+  .flow-h { display: flex; justify-content: space-between; color: var(--dim); font: 11px 'JetBrains Mono', monospace; text-transform: uppercase; letter-spacing: .12em; margin-bottom: 18px; }
+  .flow-grid { display: grid; grid-template-columns: 1fr 34px auto 34px 1fr; align-items: center; }
+  .node { border: 1px solid var(--line); background: var(--card); border-radius: 10px; padding: 10px 12px; font: 12px 'JetBrains Mono', monospace; color: var(--text); }
+  .node.src { color: var(--sky); border-color: rgba(125,211,252,.25); }
+  .node.wk { color: var(--text); }
+  .node.router { border-color: rgba(250,187,96,.45); color: var(--amber); padding: 14px 16px; text-align: center; background: rgba(250,187,96,.05); }
+  .wire { height: 2px; background: repeating-linear-gradient(90deg, rgba(250,187,96,.7) 0 6px, transparent 6px 11px); }
+  .stack { display: grid; gap: 8px; }
+  .receipt { margin-top: 18px; border-top: 1px solid var(--line); padding-top: 14px; font: 11.5px 'JetBrains Mono', monospace; color: var(--muted); }
+  .receipt span { color: var(--emerald); }
+
+  section.block { padding: 64px 0; border-top: 1px solid var(--line); }
+  h2 { font-size: 26px; letter-spacing: -.02em; margin: 0 0 8px; font-weight: 600; }
+  .sub { color: var(--muted); margin: 0 0 32px; max-width: 640px; }
+  .cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+  .card h3 { font-size: 15px; margin: 0 0 8px; font-weight: 600; }
+  .card p { color: var(--muted); font-size: 14px; margin: 0; }
+  .card code { font-size: 12px; color: var(--text); }
+
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--dim); font-weight: 500; font-size: 12px; text-transform: uppercase; letter-spacing: .08em; }
+  td code { font-size: 12.5px; }
+  .tag { display: inline-block; font: 11px 'JetBrains Mono', monospace; padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--muted); }
+  .tag.ok { color: var(--emerald); border-color: rgba(89,232,171,.3); }
+  .tag.no { color: var(--rose); border-color: rgba(251,113,133,.3); }
+  .tag.warn { color: var(--amber); border-color: rgba(250,187,96,.3); }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  pre { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 16px; overflow-x: auto; font-size: 12.5px; color: var(--text); margin: 0; }
+  .note { color: var(--muted); font-size: 13.5px; margin-top: 14px; }
+
+  footer { border-top: 1px solid var(--line); padding: 32px 0 48px; color: var(--dim); font-size: 13px; }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+
+  .hero > *, .cards > *, .split > *, .flow-grid > *, main > section { min-width: 0; }
+  pre { max-width: 100%; white-space: pre; }
+  table { display: block; overflow-x: auto; }
+  @media (max-width: 900px) {
+    .hero { grid-template-columns: 1fr; padding: 56px 0 48px; gap: 36px; }
+    h1 { font-size: 36px; }
+    .cards, .split { grid-template-columns: 1fr; }
+    nav a { margin-left: 14px; }
+  }
+  @media (max-width: 520px) {
+    .wrap { padding: 0 16px; }
+    .flow { padding: 16px; }
+    .flow-h span:last-child { display: none; }
+    .receipt { font-size: 10.5px; overflow-wrap: anywhere; }
+    nav a:not(:last-child) { display: none; }
+    h1 { font-size: 31px; }
+    .flow-grid { grid-template-columns: 1fr; gap: 10px; }
+    .wire { display: none; }
+    table { font-size: 13px; }
+    th:nth-child(3), td:nth-child(3) { display: none; }
+  }
+</style>
+</head>
+<body>
+
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="#top"><span class="mark"><i></i></span>Lingonberry Router</a>
+    <nav>
+      <a href="#how">How it works</a>
+      <a href="#security">Keys and security</a>
+      <a href="#install">Install</a>
+      <a href="#api">API</a>
+      <a href="#status">Status</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top" class="wrap">
+
+  <section class="hero">
+    <div>
+      <h1>One local router for every AI agent on your machine.</h1>
+      <p class="lede">Your agents hand work to Lingonberry. It picks a worker, runs the task, checks the result, and writes a receipt you can read. Nothing leaves your machine except the calls to the workers you configured.</p>
+      <div class="cmd">
+        <code>cargo build --release</code>
+        <button type="button" data-copy="cargo build --release" aria-label="Copy build command">copy</button>
+      </div>
+      <p class="meta">Source on GitHub. Built and tested on macOS 27.2. Version 0.1.0.</p>
+    </div>
+
+    <div class="flow" aria-label="Diagram of work moving from callers through the router to workers">
+      <div class="flow-h"><span>request path</span><span>127.0.0.1:8799</span></div>
+      <div class="flow-grid">
+        <div class="stack">
+          <div class="node src">claude</div>
+          <div class="node src">codex</div>
+          <div class="node src">shell</div>
+        </div>
+        <div class="wire"></div>
+        <div class="node router">Router<br><span style="color:var(--muted);font-size:11px">route → gate → receipt</span></div>
+        <div class="wire"></div>
+        <div class="stack">
+          <div class="node wk">jcode</div>
+          <div class="node wk">pi · NIM key</div>
+          <div class="node wk">claude CLI</div>
+        </div>
+      </div>
+      <div class="receipt">example receipt <span>d1a0f7fc</span> · class <span>research_plan</span> · skill <span>deep-retrieval-brief</span> · gate <span>citation-grounded</span></div>
+    </div>
+  </section>
+
+  <section class="block" id="how">
+    <h2>How a request moves</h2>
+    <p class="sub">Every run has a receipt. You can see the class, skill, hook, gate and the steps taken, and the output is stored with it.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>1. Route</h3>
+        <p>The prompt is classified by whole words (for example "review" and "preview" are different), a skill is matched by its name and description, and its body is added to the prompt. Long prompts are split at paragraph breaks and merged afterwards.</p>
+      </div>
+      <div class="card">
+        <h3>2. Dispatch</h3>
+        <p>The router picks a worker from the ones that are available: its CLI agent with its own login, or a provider key. Workers are tried in order, with failover and cooldown when one fails.</p>
+      </div>
+      <div class="card">
+        <h3>3. Gate and record</h3>
+        <p>The gate for the task class runs on the output. The session keeps the prompt, the router decision, every step and the output, and a receipt id you can look up later with <code>GET /receipts/:id</code>.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="security">
+    <h2>Keys and security</h2>
+    <p class="sub">The router reads your keys from your environment, your env files, and the credential files of the agents you already use. It records names only. A value is read at the moment of a call and not stored.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>Your keys stay yours</h3>
+        <p>API keys are used only by the owner: the menu bar app and the local CLI. An agent that calls the router without the app's origin gets its own CLI worker and never your keys. Checked with <code>curl</code> on a running daemon.</p>
+      </div>
+      <div class="card">
+        <h3>Local only</h3>
+        <p>The HTTP API listens on 127.0.0.1 and refuses any Host header that is not loopback, so a web page cannot use it through DNS rebinding. Browser pages can read the snapshot only from the app's own origin.</p>
+      </div>
+      <div class="card">
+        <h3>No shell from HTTP</h3>
+        <p>Jobs created over HTTP cannot carry a shell command. Shell jobs exist only in the router's own configuration. Rejected requests return 403 and are covered by tests.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="install">
+    <h2>Install</h2>
+    <p class="sub">There is no release binary yet. Build from source with the Rust toolchain. The menu bar app is a Tauri bundle built from the same source.</p>
+    <pre><code># build the core and the menu bar app (macOS)
+cd core &amp;&amp; cargo build --release
+cd .. &amp;&amp; npm install &amp;&amp; npm run build:web
+sh tray/scripts/prepare-core.sh
+cd tray &amp;&amp; ../node_modules/.bin/tauri build --bundles app
+
+# check your machine: which agents and keys were found, nothing is run
+lingonberry-core discover
+lingonberry-core doctor
+
+# see the routing decision for a prompt, nothing is run
+lingonberry-core route "review the auth middleware" --caller claude
+
+# register the router with your agents (preview first, then apply)
+lingonberry-core self-config
+lingonberry-core self-config --apply</code></pre>
+    <p class="note">Registration writes one skill, one constitution pointer, one MCP entry and a marked two-line block in each agent's instruction file. Each file is backed up before it is changed, and the block can be removed by deleting the lines between the markers.</p>
+  </section>
+
+  <section class="block" id="menubar">
+    <h2>Menu bar</h2>
+    <p class="sub">The app sits in the menu bar and shows the router only. It stays idle until something is running.</p>
+    <div class="cards">
+      <div class="card">
+        <h3>Graph</h3>
+        <p>With nothing running: one router node. While work runs: the calling agents, the router, and the workers in use, joined by lines.</p>
+      </div>
+      <div class="card">
+        <h3>Workers and providers</h3>
+        <p>Every key the router found, grouped by provider, with its calls in the last 24 hours and its calls-per-minute limit. You can change a limit with the buttons.</p>
+      </div>
+      <div class="card">
+        <h3>Sessions</h3>
+        <p>Each session shows the prompt, the router's decision (class, skill, command, hook, gate, attempts), the worker's output, and the steps. The output can be copied.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="block" id="api">
+    <h2>API</h2>
+    <p class="sub">Local HTTP on 127.0.0.1:8799. Read endpoints are open to local callers. Endpoints that change state accept only the app's origin. Agent runs accept calls with no Origin header, and those calls never receive your keys.</p>
+    <table>
+      <thead><tr><th>Endpoint</th><th>What it does</th><th>Who</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /snapshot</code></td><td>Workers, providers, sessions, jobs, system figures</td><td><span class="tag ok">local</span></td></tr>
+        <tr><td><code>POST /api/route</code></td><td>Routing receipt for a prompt. Runs nothing.</td><td><span class="tag ok">local</span></td></tr>
+        <tr><td><code>POST /api/run</code></td><td>Dispatch one task. Keys only for the app.</td><td><span class="tag ok">local</span></td></tr>
+        <tr><td><code>POST /api/fanout</code></td><td>Several prompts in parallel</td><td><span class="tag ok">local</span></td></tr>
+        <tr><td><code>GET /receipts/:id</code></td><td>One receipt by id</td><td><span class="tag ok">local</span></td></tr>
+        <tr><td><code>POST /kill/:pid</code></td><td>Stop a running worker</td><td><span class="tag warn">app only</span></td></tr>
+        <tr><td><code>POST /api/jobs</code></td><td>Create a router job (prompt only)</td><td><span class="tag warn">app only</span></td></tr>
+      </tbody>
+    </table>
+    <p class="note">From an agent, the caller name is passed with <code>--caller</code> or the <code>ROUTER_CALLER</code> environment variable. It is written into every receipt.</p>
+  </section>
+
+  <section class="block" id="status">
+    <h2>Status</h2>
+    <p class="sub">What is checked and what is not. Numbers are included only where a command produced them.</p>
+    <table>
+      <thead><tr><th>Area</th><th>State</th><th>Evidence</th></tr></thead>
+      <tbody>
+        <tr><td>Rust core</td><td><span class="tag ok">tested</span></td><td>30 unit and API tests pass (<code>cargo test --locked</code>)</td></tr>
+        <tr><td>Key discovery</td><td><span class="tag ok">tested</span></td><td>Names only, provider mapping, store reader, no value in output</td></tr>
+        <tr><td>Owner-only keys and HTTP guard</td><td><span class="tag ok">checked live</span></td><td>curl on the running daemon: no origin gets <code>KEY_FORBIDDEN</code>; rebinding, browser origin and shell jobs get 403</td></tr>
+        <tr><td>Long prompts (chunking)</td><td><span class="tag warn">tested offline</span></td><td>Split and merge tested. No live provider call yet.</td></tr>
+        <tr><td>Live provider calls</td><td><span class="tag warn">not yet</span></td><td>Routing is checked. Actual calls to each provider are not yet run end to end.</td></tr>
+        <tr><td>Cost</td><td><span class="tag no">not measured</span></td><td>Token counts are not recorded yet, so none are shown. No cost is calculated.</td></tr>
+        <tr><td>macOS</td><td><span class="tag ok">built</span></td><td>Menu bar app built and deployed on macOS 27.2</td></tr>
+        <tr><td>Linux, Windows</td><td><span class="tag no">not built</span></td><td>No build attempted</td></tr>
+        <tr><td>Signing and notarisation</td><td><span class="tag no">none</span></td><td>The app is not signed</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <span>Lingonberry Router 0.1.0 · no licence file yet</span>
+    <span>Local first. No account. No analytics calls in the code.</span>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('[data-copy]').forEach((b) => {
+    b.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(b.getAttribute('data-copy'));
+        b.textContent = 'copied';
+        setTimeout(() => (b.textContent = 'copy'), 1200);
+      } catch (e) {
+        b.textContent = 'select text';
+      }
+    });
+  });
+</script>
+</body>
+</html>
