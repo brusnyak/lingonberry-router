@@ -15,6 +15,7 @@ let package = Package(
             path: "Sources/LingonberryBar",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("SwiftUI"),
             ]
         )
     ]
