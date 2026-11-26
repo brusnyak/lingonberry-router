@@ -288,3 +288,29 @@ Do not publish a claim that smaller models match frontier models unless the benc
 6. **UI-01:** event-accurate caller → router → worker graph.
 
 **Recommended first implementation:** SEC-01, followed by GATE-01. Do not add planner autonomy on top of a bypassable credential boundary or misleading completion status.
+
+
+## 9. Product surface and UI architecture
+
+The product has two presentation scales, not two competing applications:
+
+- **macOS menu-bar companion:** quick status, active graph, live task summaries, automation health and safe quick actions.
+- **Control Center window:** persistent, resizable workspace for task DAGs, output, skills, retrieval, provider/key slots, process details, machine-wide automation and audit history.
+
+Keep Rust as the source of truth. Use SwiftUI/AppKit for the macOS shell and a versioned local API/event contract between UI and Rust. Cross-platform shells can be added later without moving routing or policy into UI code.
+
+The existing repository already contains both `ui/macos-swift` (SwiftUI MenuBarExtra, 660 pt popover, snapshot models, 2-second polling) and a React/Tauri UI (`MenuBarGiga.tsx`, 780 × 660 Tauri popover). These implementations overlap. The product UX spec designates the native SwiftUI app as the canonical macOS menu-bar experience; retain useful web/Tauri functionality during transition, but do not duplicate feature logic or keep two competing menu-bar products.
+
+The full design contract, graph behavior, automation scope, task inspector, security rules, acceptance criteria and delivery sequence live in [`docs/PRODUCT-UX-SPEC.md`](./PRODUCT-UX-SPEC.md).
+
+### Updated UX implementation order
+
+1. **UX-01:** event/DTO contract linking caller → run/task → worker → provider/model/key-slot → skill/tool → process/job → output/gate.
+2. **UX-02:** consolidate macOS menu-bar ownership on SwiftUI and define the Control Center window.
+3. **UX-03:** event-accurate horizontal graph; idle shows only router.
+4. **UX-04:** task inspector with output, skills, model/provider, timeline and evidence.
+5. **UX-05:** managed vs machine-discovered automation inventory and process monitor.
+6. **UX-06:** Control Center navigation, search and persistent inspection.
+7. **UX-07:** Linux/Windows native shells after the shared contract stabilizes.
+
+Do not polish graph visuals before the event model can represent actual dispatch edges. Do not claim machine-wide cron coverage unless every supported source reports its discovery status and limitations.
