@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub const PI_NIM_MODEL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 
 const AGENT_BINS: &[&str] = &[
-    "claude", "codex", "opencode", "kilo", "pi", "cline", "jcode", "goose", "omp", "hermes",
+    "claude", "codex", "opencode", "kilo", "pi", "cline", "goose", "omp", "hermes",
     "crush", "qwen",
 ];
 
@@ -56,17 +56,17 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
     match id {
         "nim" => Some((
             "https://integrate.api.nvidia.com/v1",
-            Some("openai"),
+            Some("openai-completions"),
             Some(PI_NIM_MODEL),
         )),
         "openrouter" => Some((
             "https://openrouter.ai/api/v1",
-            Some("openai"),
+            Some("openai-completions"),
             Some("openrouter/auto"),
         )),
         "groq" => Some((
             "https://api.groq.com/openai/v1",
-            Some("openai"),
+            Some("openai-completions"),
             Some("llama-3.1-8b-instant"),
         )),
         "anthropic" => Some((
@@ -74,34 +74,34 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
             Some("anthropic"),
             Some("claude-sonnet-4"),
         )),
-        "openai" => Some(("https://api.openai.com/v1", Some("openai"), Some("gpt-4.1"))),
+        "openai" => Some(("https://api.openai.com/v1", Some("openai-completions"), Some("gpt-4.1"))),
         "mistral" => Some((
             "https://api.mistral.ai/v1",
-            Some("openai"),
+            Some("openai-completions"),
             Some("mistral-large-latest"),
         )),
         "deepseek" => Some((
             "https://api.deepseek.com/v1",
-            Some("openai"),
+            Some("openai-completions"),
             Some("deepseek-chat"),
         )),
-        "together" => Some(("https://api.together.xyz/v1", Some("openai"), None)),
-        "fireworks" => Some(("https://api.fireworks.ai/inference/v1", Some("openai"), None)),
-        "cerebras" => Some(("https://api.cerebras.ai/v1", Some("openai"), None)),
-        "xai" => Some(("https://api.x.ai/v1", Some("openai"), Some("grok-3"))),
+        "together" => Some(("https://api.together.xyz/v1", Some("openai-completions"), None)),
+        "fireworks" => Some(("https://api.fireworks.ai/inference/v1", Some("openai-completions"), None)),
+        "cerebras" => Some(("https://api.cerebras.ai/v1", Some("openai-completions"), None)),
+        "xai" => Some(("https://api.x.ai/v1", Some("openai-completions"), Some("grok-3"))),
         "google" => Some((
             "https://generativelanguage.googleapis.com/v1beta/openai",
-            Some("openai"),
+            Some("openai-completions"),
             Some("gemini-2.5-flash"),
         )),
         "kimi" => Some((
             "https://api.moonshot.ai/v1",
-            Some("openai"),
+            Some("openai-completions"),
             Some("kimi-k2-0905-preview"),
         )),
         "qwen" => Some((
             "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
-            Some("openai"),
+            Some("openai-completions"),
             Some("qwen-plus"),
         )),
         _ => None,
@@ -342,87 +342,133 @@ pub fn ensure_tool_path() {
 
 pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
     let mut out = Vec::new();
-    let nim_keys = d.keys.get("nim").cloned().unwrap_or_default();
 
-    if !nim_keys.is_empty() {
-        out.push(DiscoveredWorker {
-            id: "pi".to_string(),
-            agent: "pi".to_string(),
-            key_name: None,
-            provider: "nim".to_string(),
-            base_url: d.providers.get("nim").map(|p| p.base_url.clone()),
-            model: Some(PI_NIM_MODEL.to_string()),
-            write_access: true,
-            path: None,
-        });
-    }
-
-    for agent in &d.agents {
-        if agent.id == "pi" {
-            // pi reads keys from environment variable names, so store-file slots are not offered to it
-            for key in nim_keys.iter().filter(|k| !k.starts_with("store:")) {
-                out.push(DiscoveredWorker {
-                    id: format!("pi:{key}"),
-                    agent: "pi".to_string(),
-                    key_name: Some(key.clone()),
-                    provider: "nim".to_string(),
-                    base_url: d.providers.get("nim").map(|p| p.base_url.clone()),
-                    model: Some(PI_NIM_MODEL.to_string()),
-                    write_access: true,
-                    path: None,
-                });
-            }
-        }
-    }
-
+    // Pi-rust workers: one per provider, keys managed via ~/.pi/agent/auth.json
+    // (lingonberry-core init populates auth.json; no keys appear in CLI args)
     for (prov, keys) in &d.keys {
-        if prov == "nim" {
+        if keys.is_empty() {
             continue;
         }
         let default_model = known_provider(prov).and_then(|(_, _, m)| m.map(str::to_string));
-        for key in keys {
-            out.push(DiscoveredWorker {
-                id: format!("{prov}:{key}"),
-                agent: prov.clone(),
-                key_name: Some(key.clone()),
-                provider: prov.clone(),
-                base_url: d.providers.get(prov).map(|p| p.base_url.clone()).filter(|u| !u.is_empty()),
-                model: default_model.clone(),
-                write_access: true,
-                path: None,
-            });
-        }
-    }
-
-    for agent in &d.agents {
-        if agent.id != "pi" && agent.id != "nim-chat" {
-            out.push(DiscoveredWorker {
-                id: agent.id.clone(),
-                agent: agent.id.clone(),
-                key_name: None,
-                provider: agent.id.clone(),
-                base_url: None,
-                model: None,
-                write_access: WRITE_AGENTS.contains(&agent.id.as_str()),
-                path: agent.path.clone(),
-            });
-        }
-    }
-
-    for key in &nim_keys {
+        let pi_agent = d.agents.iter().find(|a| a.id == "pi");
         out.push(DiscoveredWorker {
-            id: format!("nim-chat:{key}"),
-            agent: "nim-chat".to_string(),
-            key_name: Some(key.clone()),
-            provider: "nim".to_string(),
-            base_url: d.providers.get("nim").map(|p| p.base_url.clone()),
-            model: Some(PI_NIM_MODEL.to_string()),
-            write_access: false,
-            path: None,
+            id: format!("pi:{prov}"),
+            agent: "pi".to_string(),
+            key_name: None,
+            provider: prov.clone(),
+            base_url: d.providers.get(prov).map(|p| p.base_url.clone()).filter(|u| !u.is_empty()),
+            model: default_model.clone(),
+            write_access: true,
+            path: pi_agent.and_then(|a| a.path.clone()),
+        });
+    }
+
+    // CLI agent workers (each uses their own credentials, not lingonberry key pool)
+    for agent in &d.agents {
+        if agent.id == "pi" || agent.id == "nim-chat" {
+            continue; // pi handled above; nim-chat was a standalone key worker, removed
+        }
+        out.push(DiscoveredWorker {
+            id: agent.id.clone(),
+            agent: agent.id.clone(),
+            key_name: None,
+            provider: agent.id.clone(),
+            base_url: None,
+            model: None,
+            write_access: WRITE_AGENTS.contains(&agent.id.as_str()),
+            path: agent.path.clone(),
         });
     }
 
     out
+}
+
+/// Configure pi-rust credentials from discovered keys.
+/// Writes ~/.pi/agent/auth.json and ~/.pi/agent/models.json so that
+/// lingonberry-core owns the key store and pi-rust reads from it.
+/// No keys appear in CLI arguments — pi-rust reads them from its config files.
+pub fn configure_pi_rust(home: &Path, disc: &DiscoveryData) -> Result<(), Box<dyn std::error::Error>> {
+    let pi_agent_dir = home.join(".pi").join("agent");
+    std::fs::create_dir_all(&pi_agent_dir)?;
+
+    // Build auth.json: provider -> { type: "api_key", key: <value> }
+    let mut auth: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (prov, keys) in &disc.keys {
+        if keys.is_empty() {
+            continue;
+        }
+        let key_name = keys.first().cloned().unwrap_or_default();
+        let key_val = resolve_key_value(&key_name).unwrap_or_default();
+        if key_val.is_empty() {
+            continue;
+        }
+        let provider_name = match prov.as_str() {
+            "nim" => "nvidia",
+            p => p,
+        };
+        auth.insert(
+            provider_name.to_string(),
+            serde_json::json!({
+                "type": "api_key",
+                "key": key_val,
+            }),
+        );
+    }
+    let auth_json = serde_json::to_string_pretty(&serde_json::Value::Object(auth))?;
+    std::fs::write(pi_agent_dir.join("auth.json"), auth_json)?;
+
+    // Build models.json: provider blocks with baseUrl, api, apiKey, models
+    let mut providers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    for (prov, keys) in &disc.keys {
+        if keys.is_empty() {
+            continue;
+        }
+        let (base_url, api_style, default_model) = known_provider(prov)
+            .map(|(url, style, model)| (url.to_string(), style.map(|s| s.to_string()), model.map(|m| m.to_string())))
+            .unwrap_or_else(|| (String::new(), None, None));
+        if base_url.is_empty() {
+            continue;
+        }
+        let provider_name = match prov.as_str() {
+            "nim" => "nvidia",
+            p => p,
+        };
+        let models: Vec<serde_json::Value> = default_model
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "id": m,
+                    "name": m,
+                })
+            })
+            .collect();
+        let key_name = match prov.as_str() {
+            "nim" => "NIM_1",
+            "groq" => "GROQ_API_KEY",
+            "google" => "GOOGLE_STUDIO_API",
+            "openrouter" => "OPENROUTER_API_KEY",
+            p => &format!("{}_API_KEY", p.to_uppercase()),
+        };
+        let key_val = resolve_key_value(key_name).unwrap_or_default();
+        if key_val.is_empty() {
+            continue;
+        }
+        providers.insert(
+            provider_name.to_string(),
+            serde_json::json!({
+                "baseUrl": base_url,
+                "api": api_style.unwrap_or_else(|| "openai-completions".to_string()),
+                "apiKey": key_val,
+                "models": models,
+            }),
+        );
+    }
+    let models_json = serde_json::to_string_pretty(&serde_json::json!({
+        "providers": serde_json::Value::Object(providers)
+    }))?;
+    std::fs::write(pi_agent_dir.join("models.json"), models_json)?;
+
+    Ok(())
 }
 
 #[cfg(test)]

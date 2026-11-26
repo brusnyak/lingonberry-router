@@ -741,13 +741,17 @@ pub fn dispatch_run_async(
 
             if let Some(ref bin_path) = worker.path {
                 if worker.key_name.is_none() && std::path::Path::new(bin_path).exists() {
-                    let args: Vec<&str> = match worker.agent.as_str() {
-                        "claude" => vec!["-p", &cooked.cooked_prompt],
-                        "codex" => vec!["exec", &cooked.cooked_prompt],
-                        "jcode" => vec!["run", &cooked.cooked_prompt],
-                        "opencode" => vec!["run", &cooked.cooked_prompt],
-                        "omp" => vec!["-p", &cooked.cooked_prompt],
-                        _ => vec![&cooked.cooked_prompt],
+                    let args: Vec<String> = match worker.agent.as_str() {
+                        "claude" => vec!["-p".to_string(), cooked.cooked_prompt.clone()],
+                        "codex" => vec!["exec".to_string(), cooked.cooked_prompt.clone()],
+                        "opencode" => vec!["run".to_string(), cooked.cooked_prompt.clone()],
+                        "omp" => vec!["-p".to_string(), cooked.cooked_prompt.clone()],
+                        "pi" => {
+                            let provider = if worker.provider.is_empty() { "nim".to_string() } else { worker.provider.clone() };
+                            let model = worker.model.clone().unwrap_or_else(|| "nvidia/nemotron-3.5-super-vl-120b-a12b".to_string());
+                            vec!["-p".to_string(), "--provider".to_string(), provider, "--model".to_string(), model, cooked.cooked_prompt.clone()]
+                        }
+                        _ => vec![cooked.cooked_prompt.clone()],
                     };
                     if let Ok(child) = TokioCommand::new(bin_path)
                         .args(&args)

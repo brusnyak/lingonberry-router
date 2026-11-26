@@ -24,7 +24,5 @@
 	<true/>
 	<key>NSHumanReadableCopyright</key>
 	<string>© 2026 Lingonberry Router</string>
-	<key>NSPrincipalClass</key>
-	<string>LingonberryBarApp</string>
 </dict>
 </plist>

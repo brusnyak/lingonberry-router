@@ -19,7 +19,15 @@ class LingonberryBarApp: NSObject, NSApplicationDelegate {
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(named: "LingonberryIcon")
+            // Load icon from bundle URL directly (more reliable than NSImage(named:) for menu-bar apps)
+            var icon: NSImage? = nil
+            if let url = Bundle.main.url(forResource: "LingonberryIcon", withExtension: "icns") {
+                icon = NSImage(contentsOf: url)
+            }
+            if icon == nil, let url = Bundle.main.url(forResource: "lingonberry-icon", withExtension: "png") {
+                icon = NSImage(contentsOf: url)
+            }
+            button.image = icon
             button.image?.size = NSSize(width: 18, height: 18)
             button.action = #selector(togglePopover)
             button.target = self

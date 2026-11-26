@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use lingonberry_core::agents::{apply_self_config_targets, build_self_config_plan, route_prompt};
 use lingonberry_core::config::{load_config, validate_config, write_default_config};
-use lingonberry_core::discovery::scan_discovery;
+use lingonberry_core::discovery::{configure_pi_rust, scan_discovery};
 use lingonberry_core::registry::Registry;
 use lingonberry_core::server::{build_router, dispatch_run_async, serve, AppState};
 use lingonberry_core::storage::SqliteStore;
@@ -82,6 +82,10 @@ async fn main() -> Result<()> {
             let disc = scan_discovery();
             let cfg = load_config()?;
             let plan = build_self_config_plan(&disc, &cfg, &BTreeSet::new());
+            // Auto-configure pi-rust credentials from discovered keys
+            if let Some(home) = dirs::home_dir() {
+                let _ = configure_pi_rust(&home, &disc);
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
