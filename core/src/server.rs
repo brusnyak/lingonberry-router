@@ -2,11 +2,11 @@ use crate::agents::{
     apply_self_config_targets, build_self_config_plan, call_chunked, call_provider_api, cook_prompt,
     is_output_truncated, route_prompt_with,
 };
-use crate::config::{load_config, Config};
+use crate::config::{load_config, Config, ExecutionMode};
 use crate::cron::{execute_os_cron_command, kill_os_pid};
 use crate::discovery::{redact_secrets, scan_discovery};
 use crate::events::log_event;
-use crate::registry::{now_sec, Registry};
+use crate::registry::{now_sec, LeaseGuard, Registry};
 use crate::storage::SqliteStore;
 use crate::types::{
     DiscoveryData, JobRow, LiveWorker, Overview, RouterState, Run, RunState, SelfConfigPlan,
@@ -21,7 +21,7 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use sysinfo::{Disks, System};
 use tokio::net::TcpListener;
@@ -41,6 +41,11 @@ pub struct AppState {
     pub telemetry: Arc<Mutex<VecDeque<TelemetryPoint>>>,
     pub next_pid: Arc<AtomicU32>,
     pub shutdown_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    /// Set true by the load watcher when system CPU/RAM exceeds thresholds.
+    /// When set, non-pi (local CLI) workers are refused dispatch to protect the machine.
+    pub load_throttled: Arc<AtomicBool>,
+    /// Live (real provider call) or simulate (labelled stub). Set from config at boot.
+    pub execution: ExecutionMode,
 }
 
 impl AppState {
@@ -77,6 +82,7 @@ impl AppState {
             .map(|p| p + 1)
             .unwrap_or(1);
         Self {
+            execution: config.execution,
             config: Arc::new(Mutex::new(config)),
             discovery: Arc::new(Mutex::new(discovery)),
             registry,
@@ -87,6 +93,7 @@ impl AppState {
             telemetry: Arc::new(Mutex::new(telemetry)),
             next_pid: Arc::new(AtomicU32::new(next_pid_start)),
             shutdown_tx: Arc::new(Mutex::new(None)),
+            load_throttled: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -316,7 +323,9 @@ pub fn dispatch_run_async(
     fanout_group: Option<String>,
     allow_keys: bool,
 ) -> Run {
-    let live_api = live_api && allow_keys;
+    let live_api = allow_keys
+        && std::env::var("LINGONBERRY_SIMULATE").ok().as_deref() != Some("1")
+        && (live_api || state.execution == ExecutionMode::Live);
     let discovery = state.discovery.lock().unwrap().clone();
     let receipt = route_prompt_with(
         &prompt,
@@ -329,23 +338,69 @@ pub fn dispatch_run_async(
     );
     let _ = state.store.insert_receipt(&receipt);
 
-    let chosen = worker_id
-        .as_deref()
-        .and_then(|id| state.registry.find_worker(id))
-        .or_else(|| {
-            receipt
-                .selected
-                .as_ref()
-                .and_then(|s| state.registry.find_worker(&s.worker))
-        })
-        .or_else(|| state.registry.select_best_worker());
-
     let cooked = receipt
         .cooked
         .clone()
         .unwrap_or_else(|| cook_prompt(&prompt, &discovery, &phase, use_worktree));
 
     let now = now_sec();
+
+    // Explicit --worker must resolve to a real worker; never silently fall back.
+    let chosen = match worker_id.as_deref() {
+        Some(id) => match state.registry.find_worker(id) {
+            Some(w) => Some(w),
+            None => {
+                let failed = Run {
+                    id: Uuid::new_v4().to_string()[..8].to_string(),
+                    created_at: Utc::now().to_rfc3339(),
+                    worker: id.to_string(),
+                    caller: caller.clone(),
+                    key_name: None,
+                    model: None,
+                    provider: None,
+                    prompt: prompt.clone(),
+                    gate: Some(cooked.gate_policy.clone()),
+                    state: RunState::Failed,
+                    pid: None,
+                    elapsed_ms: Some(5),
+                    gate_passed: Some(false),
+                    error: Some(format!("unknown worker: {id}")),
+                    output: None,
+                    task_class: Some(cooked.task_class.clone()),
+                    receipt_id: Some(receipt.receipt_id.clone()),
+                    cooked: Some(cooked),
+                    steps: vec![
+                        SessionStep {
+                            ts: now,
+                            stage: "received".into(),
+                            title: "Prompt received".into(),
+                            detail: format!("{} · {}", caller.as_deref().unwrap_or("shell"), prompt.clone()),
+                            tone: "info".into(),
+                        },
+                        SessionStep {
+                            ts: now + 0.1,
+                            stage: "routed".into(),
+                            title: "Worker lookup failed".into(),
+                            detail: format!("No worker with id '{id}' in registry"),
+                            tone: "error".into(),
+                        },
+                    ],
+                    fanout_group,
+                    failover_from: None,
+                    tokens_in: None,
+                    tokens_out: None,
+                };
+                let _ = state.store.insert_run(&failed);
+                return failed;
+            }
+        },
+        None => receipt
+            .selected
+            .as_ref()
+            .and_then(|s| state.registry.find_worker(&s.worker))
+            .or_else(|| state.registry.select_best_worker()),
+    };
+
     let steps = vec![
         SessionStep {
             ts: now,
@@ -363,7 +418,7 @@ pub fn dispatch_run_async(
         },
     ];
 
-    let Some(worker) = chosen else {
+    let Some(mut worker) = chosen else {
         let failed = Run {
             id: Uuid::new_v4().to_string()[..8].to_string(),
             created_at: Utc::now().to_rfc3339(),
@@ -393,14 +448,79 @@ pub fn dispatch_run_async(
         return failed;
     };
 
-    let guard = if worker.key_name.is_some() || worker.agent == "pi" {
+    // Load watcher: refuse non-pi (local CLI) worker dispatch when the machine is overloaded.
+    // pi workers call external APIs (no local process), so they are always exempt.
+    if state.load_throttled.load(Ordering::Relaxed) && worker.agent != "pi" {
+        let failed = Run {
+            id: Uuid::new_v4().to_string()[..8].to_string(),
+            created_at: Utc::now().to_rfc3339(),
+            worker: worker.id.clone(),
+            caller,
+            key_name: None,
+            model: None,
+            provider: None,
+            prompt,
+            gate: Some(cooked.gate_policy.clone()),
+            state: RunState::Failed,
+            pid: None,
+            elapsed_ms: Some(5),
+            gate_passed: Some(false),
+            error: Some(format!(
+                "local worker {} paused: machine overloaded (cpu/ram high); use pi workers instead",
+                worker.id
+            )),
+            output: None,
+            task_class: Some(cooked.task_class.clone()),
+            receipt_id: Some(receipt.receipt_id.clone()),
+            cooked: Some(cooked),
+            steps: vec![
+                SessionStep {
+                    ts: now,
+                    stage: "routed".into(),
+                    title: "Load throttled".into(),
+                    detail: format!(
+                        "Worker {} rejected: system load above threshold",
+                        worker.id
+                    ),
+                    tone: "error".into(),
+                },
+            ],
+            fanout_group,
+            failover_from: None,
+            tokens_in: None,
+            tokens_out: None,
+        };
+        let _ = state.store.insert_run(&failed);
+        return failed;
+    }
+
+    let mut guard: Option<LeaseGuard> = None;
+    let mut failover_from: Option<String> = None;
+    if worker.key_name.is_some() || worker.agent == "pi" {
         match state
             .registry
             .lease_guard(worker.key_name.as_deref(), Some(&worker.provider))
         {
-            Ok(g) => Some(g),
+            Ok(g) => guard = Some(g),
             Err(e) => {
-                let blocked = Run {
+                // Routing reads the pool a moment before the lease; under concurrency the chosen
+                // provider can be full. Move to another provider with free slots instead of
+                // blocking a run that a healthy key could have served.
+                let original = worker.id.clone();
+                let alt = state.registry.select_best_worker_excluding(Some(&worker.id));
+                let switched = alt.and_then(|alt| {
+                    state
+                        .registry
+                        .lease_guard(alt.key_name.as_deref(), Some(&alt.provider))
+                        .ok()
+                        .map(|g| (alt, g))
+                });
+                if let Some((alt, g)) = switched {
+                    failover_from = Some(original);
+                    worker = alt;
+                    guard = Some(g);
+                } else {
+                    let blocked = Run {
                     id: Uuid::new_v4().to_string()[..8].to_string(),
                     created_at: Utc::now().to_rfc3339(),
                     worker: worker.id.clone(),
@@ -427,11 +547,10 @@ pub fn dispatch_run_async(
                 };
                 let _ = state.store.insert_run(&blocked);
                 return blocked;
+                }
             }
         }
-    } else {
-        None
-    };
+    }
 
     let key_name = guard.as_ref().map(|g| g.key_name().to_string());
     let mut full_steps = steps;
@@ -480,7 +599,7 @@ pub fn dispatch_run_async(
         cooked: Some(cooked.clone()),
         steps: full_steps,
         fanout_group: fanout_group.clone(),
-        failover_from: None,
+        failover_from,
         tokens_in: None,
         tokens_out: None,
     };
@@ -829,15 +948,18 @@ pub fn dispatch_run_async(
             }
 
             // Direct provider-API worker (a keyed slot such as pi:NIM_1): call the provider
-            // and measure real elapsed/tokens instead of the fixed stub. Falls through to the
-            // generic stub below for any worker that is neither a CLI spawn nor a keyed provider.
-            if worker.key_name.is_some()
+            // and measure real elapsed/tokens. Only when live dispatch is on — simulate mode
+            // must never spend an owner key. `key_name` is the leased slot (the worker's own
+            // field for keyed workers, the leased key for `pi` workers which lease at dispatch
+            // time and have no fixed key_name), so no external pi-rust binary is required.
+            if live_api
+                && key_name.is_some()
                 && worker.base_url.is_some()
                 && worker.model.is_some()
             {
                 let started = std::time::Instant::now();
                 let base = worker.base_url.as_deref().unwrap();
-                let key = worker.key_name.as_deref().unwrap();
+                let key = key_name.as_deref().unwrap();
                 let model = worker.model.as_deref().unwrap();
                 let live_result = call_chunked(base, key, model, &cooked).await;
                 let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -880,32 +1002,38 @@ pub fn dispatch_run_async(
                 // so the run is still recorded rather than lost. The guard will be released by the stub.
             }
 
-            tokio::time::sleep(std::time::Duration::from_millis(2400)).await;
-            if let Some(g) = guard {
-                g.complete(true, None);
+            // No executor handled this worker: record a clearly labelled simulation instead of
+            // claiming success. The key was leased but never called — release it without a
+            // failure penalty so a healthy key stays in rotation.
+            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+            if let Some(g) = guard.take() {
+                g.cancel();
             }
             state.store.append_step(
                 &run_id,
                 SessionStep {
                     ts: now_sec(),
                     stage: "gate".into(),
-                    title: "Execution completed".into(),
-                    detail: format!("Gate {} passed", cooked.gate_policy),
-                    tone: "done".into(),
+                    title: "Simulated — no executor".into(),
+                    detail: format!(
+                        "worker {} has no CLI binary and live dispatch is off; nothing was called",
+                        worker.id
+                    ),
+                    tone: "warn".into(),
                 },
             );
             state.store.finish_run(
                 &run_id,
                 RunState::Done,
-                Some(2400),
-                Some(true),
+                Some(120),
+                None,
                 None,
                 Some(redact_secrets(&format!(
-                    "Dispatched via {} · skill={} · gate={} passed",
+                    "[simulated] {} · skill={} · gate={} not executed",
                     worker.id, cooked.selected_skill, cooked.gate_policy
                 ))),
-                Some(480),
-                Some(310),
+                None,
+                None,
             );
         };
 
@@ -946,6 +1074,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/capabilities", get(get_capabilities))
         .route("/keys", get(get_keys))
         .route("/api/keys", get(get_keys))
+        .route("/api/load", get(get_load))
         .route("/keys/:name/reset", post(post_key_reset))
         .route("/api/keys/:name/reset", post(post_key_reset))
         .route("/api/keys/:name/rpm", post(post_key_rpm))
@@ -992,6 +1121,21 @@ async fn get_keys(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.registry.key_status())
 }
 
+/// Current machine load and throttling state. Used by the UI to decide whether
+/// to show local CLI workers or route everything through pi workers.
+async fn get_load(State(state): State<AppState>) -> impl IntoResponse {
+    let sys = collect_system_info();
+    let throttled = state.load_throttled.load(Ordering::Relaxed);
+    Json(serde_json::json!({
+        "throttled": throttled,
+        "cpu_pct": sys.cpu_pct,
+        "ram_pct": sys.ram_used_gb.zip(sys.ram_total_gb).map(|(u, t)| (u / t) * 100.0),
+        "load1": sys.load1,
+        "app_ram_gb": sys.app_ram_gb,
+        "active_runs": state.store.list_runs().iter().filter(|r| r.state == RunState::Running || r.state == RunState::Leased).count(),
+    }))
+}
+
 async fn get_runs(State(state): State<AppState>) -> impl IntoResponse {
     Json(state.store.list_runs())
 }
@@ -1028,11 +1172,16 @@ fn owner_origin_value(origin: &axum::http::HeaderValue, _: &axum::http::request:
 }
 
 pub fn is_owner_request(headers: &axum::http::HeaderMap) -> bool {
-    headers
+    match headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
-        .map(is_owner_origin_str)
-        .unwrap_or(false)
+    {
+        // Tauri frontend origin, or any local/non-browser request (no Origin header). The
+        // `guard` middleware already restricts Host to loopback, so a headerless request is
+        // from a local client (MenuBarExtra app, CLI, curl), not a browser — it may spend keys.
+        Some(o) => is_owner_origin_str(o),
+        None => true,
+    }
 }
 
 /// Host and Origin guard. Blocks DNS rebinding (Host must be loopback), blocks state changes from
@@ -1551,6 +1700,34 @@ pub async fn serve(addr: &str) -> anyhow::Result<()> {
             });
             while ring.len() > 36 {
                 ring.pop_front();
+            }
+        }
+    });
+
+    // Load watcher: throttle non-pi (local CLI) worker dispatch when machine is overloaded.
+    // pi workers call external APIs (no local process), so they are exempt.
+    let load_state = state.clone();
+    tokio::spawn(async move {
+        let mut sys = System::new_all();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            sys.refresh_cpu_usage();
+            sys.refresh_memory();
+            let cpu_pct = sys.cpus().iter().map(|c| c.cpu_usage()).sum::<f32>() / sys.cpus().len() as f32;
+            let ram_total = sys.total_memory();
+            let ram_used = sys.used_memory();
+            let ram_pct = if ram_total > 0 {
+                ram_used as f32 / ram_total as f32 * 100.0
+            } else {
+                0.0
+            };
+            let overloaded = cpu_pct > 85.0 || ram_pct > 90.0;
+            let recovered = cpu_pct < 70.0 && ram_pct < 80.0;
+            if overloaded {
+                load_state.load_throttled.store(true, Ordering::Relaxed);
+            } else if recovered {
+                load_state.load_throttled.store(false, Ordering::Relaxed);
             }
         }
     });

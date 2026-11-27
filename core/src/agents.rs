@@ -453,10 +453,30 @@ pub fn route_prompt_with(
         };
     }
 
-    let mut scored: Vec<(f64, DiscoveredWorker)> = candidates
-        .into_iter()
-        .map(|w| (preference_score(&w), w))
-        .collect();
+    let mut scored: Vec<(f64, DiscoveredWorker)> = {
+        // Capacity tiebreak: among workers of the same agent family (all `pi:*` score 1.00),
+        // prefer the provider with the most free key slots. Weight is below the 0.05 agent-rank
+        // gap, so it never promotes a CLI worker over `pi`, only spreads pi traffic across
+        // providers as keys saturate.
+        let key_backed = |w: &DiscoveredWorker| w.key_name.is_some() || w.base_url.is_some();
+        let max_headroom = candidates
+            .iter()
+            .filter(|w| key_backed(w))
+            .map(|w| registry.provider_headroom(&w.provider))
+            .max()
+            .unwrap_or(0);
+        candidates
+            .into_iter()
+            .map(|w| {
+                let cap = if key_backed(&w) && max_headroom > 0 {
+                    registry.provider_headroom(&w.provider) as f64 / max_headroom as f64
+                } else {
+                    0.0
+                };
+                (preference_score(&w) + 0.04 * cap, w)
+            })
+            .collect()
+    };
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
     let to_sel = |(score, w): &(f64, DiscoveredWorker)| ReceiptSelection {
@@ -698,7 +718,7 @@ pub async fn call_provider_api(
     // Timeout and token budget are env-tunable: a stalled NIM socket used to hang the run forever,
     // and 512 tokens is below the reasoning budget of nemotron-3.5-super-vl (empty content, finish=length).
     let timeout_s: u64 = std::env::var("LINGONBERRY_HTTP_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(240);
-    let max_tokens: u64 = std::env::var("LINGONBERRY_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
+    let max_tokens: u64 = std::env::var("LINGONBERRY_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_s))
         .user_agent("lingonberry-router/0.1")
@@ -754,6 +774,19 @@ mod tests {
             stores: vec![],
         };
         discovery.keys.insert("nim".into(), vec!["NIM_1".into()]);
+        discovery.providers.insert(
+            "nim".into(),
+            crate::types::Provider {
+                id: "nim".into(),
+                base_url: "https://integrate.api.nvidia.com/v1".into(),
+                style: Some("openai".into()),
+            },
+        );
+        // crush is not in WRITE_AGENTS, so it is the read-only worker this test needs.
+        discovery.agents.push(crate::types::Agent {
+            id: "crush".into(),
+            path: Some("/bin/true".into()),
+        });
         let reg = Registry::new(&discovery, &Config::default());
         let rcpt = route_prompt("delete stale build artifacts", "execute", Some("shell"), &discovery, &reg, false);
         assert!(rcpt.exclusions.iter().any(|e| e.code == "NO_WRITE_ACCESS"));
@@ -773,7 +806,7 @@ mod tests {
         };
         discovery.keys.insert("groq".into(), vec!["GROQ_API_KEY".into()]);
         let reg = Registry::new(&discovery, &Config::default());
-        reg.mark_worker_down("groq:GROQ_API_KEY", true);
+        reg.mark_worker_down("pi:groq", true);
         let rcpt = route_prompt("summarize logs", "plan", Some("shell"), &discovery, &reg, false);
         assert!(rcpt.exclusions.iter().any(|e| e.code == "DOCTOR_DOWN"));
     }

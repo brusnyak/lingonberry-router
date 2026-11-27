@@ -1,74 +1,60 @@
 import Foundation
 
+// MARK: - Snapshot (GET /api/snapshot)
+
+struct Snapshot: Codable {
+    let ts: Double
+    let overview: Overview
+    let workers: [WorkerStatus]
+    let workers_live: [LiveWorker]
+    let sessions: [SessionRow]
+    let jobs: [JobRow]
+    let cron_live: [CronJob]
+    let router: RouterState
+    let system: SystemInfo
+    let telemetry: [TelemetryPoint]
+}
+
 struct Overview: Codable {
     let running: Int
-    let liveWorkers: Int
-    let completed24h: Int
-    let failed24h: Int
-    let avgDurationS: Double?
-    let cost24hUsd: Double?
-    let calls24h: Int?
-    let cpuPct: Double?
-
-    enum CodingKeys: String, CodingKey {
-        case running
-        case liveWorkers = "live_workers"
-        case completed24h = "completed_24h"
-        case failed24h = "failed_24h"
-        case avgDurationS = "avg_duration_s"
-        case cost24hUsd = "cost_24h_usd"
-        case calls24h = "calls_24h"
-        case cpuPct = "cpu_pct"
-    }
+    let live_workers: Int
+    let completed_24h: Int
+    let failed_24h: Int
+    let avg_duration_s: Double?
+    let cost_24h_usd: Double?
+    let calls_24h: Int?
+    let cpu_pct: Double?
 }
 
 struct WorkerStatus: Codable, Identifiable {
-    var id: String { name }
     let name: String
     let status: String
-    let calls24h: Int
-    let ok24h: Int
+    let calls_24h: Int
+    let ok_24h: Int
     let key: String?
     let provider: String?
-    let coolingRemainingS: UInt64
+    let cooling_remaining_s: UInt64
+    let rpm_limit: Int
+    let inflight: Int
 
-    enum CodingKeys: String, CodingKey {
-        case name, status, key, provider
-        case calls24h = "calls_24h"
-        case ok24h = "ok_24h"
-        case coolingRemainingS = "cooling_remaining_s"
-    }
+    var id: String { name }
+    var isCooling: Bool { cooling_remaining_s > 0 }
 }
 
 struct LiveWorker: Codable, Identifiable {
-    var id: String { "\(pid)-\(worker)" }
-    let pid: UInt32
+    let pid: Int
     let worker: String
-    let caller: String?
+    let caller: String
     let key: String?
     let model: String?
     let provider: String?
-    let runId: String?
+    let run_id: String?
     let task: String
     let started: Double
-    let elapsedS: Double
-    let fanoutGroup: String?
+    let elapsed_s: Double
+    let fanout_group: String?
 
-    enum CodingKeys: String, CodingKey {
-        case pid, worker, caller, key, model, provider, task, started
-        case runId = "run_id"
-        case elapsedS = "elapsed_s"
-        case fanoutGroup = "fanout_group"
-    }
-}
-
-struct SessionStep: Codable, Identifiable {
-    var id: String { "\(ts)-\(stage)-\(title)" }
-    let ts: Double
-    let stage: String
-    let title: String
-    let detail: String
-    let tone: String
+    var id: String { run_id ?? worker }
 }
 
 struct SessionRow: Codable, Identifiable {
@@ -76,80 +62,84 @@ struct SessionRow: Codable, Identifiable {
     let ts: Double
     let prompt: String
     let worker: String
-    let caller: String?
+    let caller: String
     let key: String?
     let state: String
-    let durationS: Double
+    let duration_s: Double
     let reason: String?
     let output: String?
-    let receiptId: String?
+    let receipt_id: String?
+    let cooked: CookedPromptInfo?
     let steps: [SessionStep]
-    let fanoutGroup: String?
-    let failoverFrom: String?
-    let tokensIn: UInt64?
-    let tokensOut: UInt64?
+    let fanout_group: String?
+    let failover_from: String?
+    let tokens_in: Int?
+    let tokens_out: Int?
+}
 
-    enum CodingKeys: String, CodingKey {
-        case id, ts, prompt, worker, caller, key, state, reason, output, steps
-        case durationS = "duration_s"
-        case receiptId = "receipt_id"
-        case fanoutGroup = "fanout_group"
-        case failoverFrom = "failover_from"
-        case tokensIn = "tokens_in"
-        case tokensOut = "tokens_out"
-    }
+struct SessionStep: Codable, Identifiable {
+    let ts: Double
+    let stage: String
+    let title: String
+    let detail: String
+    let tone: String
+
+    var id: String { "\(ts)-\(stage)" }
+}
+
+struct CookedPromptInfo: Codable {
+    let raw_prompt: String
+    let cooked_prompt: String
+    let task_class: String
+    let selected_skill: String
+    let selected_command: String
+    let selected_hook: String
+    let retrieval_sources: [String]
+    let gate_policy: String
 }
 
 struct JobRow: Codable, Identifiable {
-    var id: String { name }
     let name: String
-    let source: String
-    let schedule: String
-    let command: String
-    let everyS: UInt64?
-    let last: Double?
-    let rc: Int32?
-    let paused: Bool?
-    let nextInS: UInt64?
+    let every_s: Int?
+    let schedule: String?
+    let command: String?
     let prompt: String?
-    let health: String
-    let runningPid: UInt32?
-    let crashCount: UInt32
-    let restartCount: UInt32
-    let autoRestart: Bool
-    let lastError: String?
-    let logTail: [String]
+    let source: String?
+    let auto_restart: Bool?
+    let health: String?
+    let crash_count: Int?
+    let last: Double?
+    let rc: Int?
+    let paused: Bool?
+    let next_in_s: Int?
+    let running_pid: Int?
+    let restart_count: Int?
+    let last_error: String?
+    let log_tail: [String]?
 
-    enum CodingKeys: String, CodingKey {
-        case name, source, schedule, command, last, rc, paused, prompt, health
-        case everyS = "every_s"
-        case nextInS = "next_in_s"
-        case runningPid = "running_pid"
-        case crashCount = "crash_count"
-        case restartCount = "restart_count"
-        case autoRestart = "auto_restart"
-        case lastError = "last_error"
-        case logTail = "log_tail"
+    var id: String { name }
+
+    var nextRun: String {
+        guard let n = next_in_s else { return paused == true ? "paused" : "manual" }
+        if n >= 3600 { return String(format: "in %dh %02dm", n / 3600, (n % 3600) / 60) }
+        if n >= 60 { return "in \(n / 60)m \(n % 60)s" }
+        return "in \(n)s"
+    }
+
+    var lastRun: String {
+        guard let l = last else { return "never" }
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f.string(from: Date(timeIntervalSince1970: l))
     }
 }
 
-struct LiveCronProcess: Codable, Identifiable {
-    var id: UInt32 { pid }
-    let pid: UInt32
-    let jobName: String
-    let source: String
-    let command: String
-    let cpuPct: Double
-    let memMb: Double
-    let elapsedS: UInt64
+struct CronJob: Codable, Identifiable {
+    let job_name: String
+    let mem_mb: Double?
+    let health: String?
 
-    enum CodingKeys: String, CodingKey {
-        case pid, source, command
-        case jobName = "job_name"
-        case cpuPct = "cpu_pct"
-        case memMb = "mem_mb"
-        case elapsedS = "elapsed_s"
-    }
+    var id: String { job_name }
 }
 
 struct RouterState: Codable {
@@ -159,37 +149,134 @@ struct RouterState: Codable {
 }
 
 struct SystemInfo: Codable {
-    let cpuPct: Double?
+    let cpu_pct: Double?
     let load1: Double?
-    let ramUsedGb: Double?
-    let ramTotalGb: Double?
-    let diskUsedGb: Double?
-    let diskTotalGb: Double?
-
-    enum CodingKeys: String, CodingKey {
-        case load1
-        case cpuPct = "cpu_pct"
-        case ramUsedGb = "ram_used_gb"
-        case ramTotalGb = "ram_total_gb"
-        case diskUsedGb = "disk_used_gb"
-        case diskTotalGb = "disk_total_gb"
-    }
+    let ram_used_gb: Double?
+    let ram_total_gb: Double?
+    let disk_used_gb: Double?
+    let disk_total_gb: Double?
+    let app_cpu_pct: Double?
+    let app_ram_gb: Double?
 }
 
-struct Snapshot: Codable {
+struct TelemetryPoint: Codable {
     let ts: Double
-    let overview: Overview
-    let workers: [WorkerStatus]
-    let workersLive: [LiveWorker]
-    let sessions: [SessionRow]
-    let jobs: [JobRow]
-    let cronLive: [LiveCronProcess]
-    let router: RouterState
-    let system: SystemInfo
+    let cpu_pct: Double
+    let ram_pct: Double
+    let disk_pct: Double
+    let active_runs: Int
+    let rpm: Int
+}
 
-    enum CodingKeys: String, CodingKey {
-        case ts, overview, workers, sessions, jobs, router, system
-        case workersLive = "workers_live"
-        case cronLive = "cron_live"
-    }
+// MARK: - Route receipt (GET /api/route)
+
+struct Receipt: Codable {
+    let receipt_id: String
+    let context_hash: String
+    let catalog_hash: String
+    let policy_hash: String
+    let pool_hash: String
+    let registry_hash: String
+    let phase: String
+    let selected: ReceiptSelection
+    let alternatives: [ReceiptSelection]
+    let exclusions: [ReceiptExclusion]
+    let abstention: String?
+    let created_at: String
+    let caller: String
+    let cooked: CookedPromptInfo?
+}
+
+struct ReceiptSelection: Codable {
+    let worker: String
+    let model: String?
+    let effort: String
+    let gate: String
+    let reason: String
+}
+
+struct ReceiptExclusion: Codable {
+    let candidate_id: String
+    let code: String
+    let evidence: String
+}
+
+// MARK: - Run
+
+struct RunRow: Codable, Identifiable {
+    let id: String
+    let created_at: String
+    let worker: String
+    let caller: String?
+    let key_name: String?
+    let model: String?
+    let provider: String?
+    let prompt: String
+    let gate: String?
+    let state: String
+    let pid: Int?
+    let elapsed_ms: Int?
+    let gate_passed: Bool?
+    let error: String?
+    let output: String?
+    let task_class: String?
+    let receipt_id: String?
+    let tokens_in: Int?
+    let tokens_out: Int?
+}
+
+// MARK: - Keys (GET /api/keys)
+
+struct KeyStatus: Codable, Identifiable {
+    let name: String
+    let status: String
+    let calls_24h: Int
+    let ok_24h: Int
+    let key: String?
+    let provider: String?
+    let cooling_remaining_s: UInt64
+    let rpm_limit: Int
+    let inflight: Int
+
+    var id: String { name }
+    var isCooling: Bool { cooling_remaining_s > 0 }
+}
+
+// MARK: - Version
+
+struct VersionResp: Codable {
+    let pid: Int
+    let version: String
+    let exe_mtime: Double
+}
+
+// MARK: - API request bodies
+
+struct RouteBody: Codable {
+    let prompt: String
+    let phase: String?
+    let caller: String?
+    let worktree: Bool?
+}
+
+struct RunBody: Codable {
+    let prompt: String
+    let caller: String?
+    let worker: String?
+    let phase: String?
+    let worktree: Bool?
+    let simulate_fault: String?
+    let live_api: Bool?
+}
+
+/// Wrapper for POST /api/run response: { "run": RunRow, "snapshot": Snapshot }
+struct RunResponse: Codable {
+    let run: RunRow
+}
+
+struct FanoutBody: Codable {
+    let prompts: [String]?
+    let prompt: String?
+    let caller: String?
+    let worktree: Bool?
 }

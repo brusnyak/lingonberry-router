@@ -34,6 +34,63 @@
   animation: route-flow 1.4s linear infinite;
 }
 
+@keyframes dash {
+  to {
+    stroke-dashoffset: -20;
+  }
+}
+
+/* Theme-aware surface tokens so the UI respects day/night by system. */
+:root {
+  --lb-surface: #ffffff;
+  --lb-surface-alt: #f8f9fb;
+  --lb-panel: #f8f9fb;
+  --lb-border: #e2e4e7;
+  --lb-text: #0f172a;
+  --lb-text-muted: #64748b;
+  --lb-text-dim: #94a3b8;
+  --lb-accent: #e5a950;
+  --lb-accent-text: #92400e;
+  --lb-success: #10b981;
+  --lb-danger: #ef4444;
+}
+
+.dark {
+  --lb-surface: #0b0d12;
+  --lb-surface-alt: #11131b;
+  --lb-panel: #11131b;
+  --lb-border: #23262e;
+  --lb-text: #f1f2f6;
+  --lb-text-muted: #9ba1b4;
+  --lb-text-dim: #646d79;
+  --lb-accent: #fabb60;
+  --lb-accent-text: #fde68a;
+  --lb-success: #34d399;
+  --lb-danger: #fb7185;
+}
+
+.lb-surface {
+  background-color: var(--lb-surface);
+}
+.lb-surface-alt {
+  background-color: var(--lb-surface-alt);
+}
+.lb-panel {
+  background-color: var(--lb-panel);
+}
+.lb-border {
+  border-color: var(--lb-border);
+}
+.lb-text {
+  color: var(--lb-text);
+}
+.lb-text-muted {
+  color: var(--lb-text-muted);
+}
+.lb-text-dim {
+  color: var(--lb-text-dim);
+}
+
 ::-webkit-scrollbar {
   width: 5px;
   height: 5px;

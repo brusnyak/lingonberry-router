@@ -13,6 +13,21 @@ fn whole_secs<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u64
     }
 }
 
+/// How a dispatcher that is allowed to spend owner keys behaves.
+/// `live` = call the provider and store the real answer. `simulate` = record a labelled stub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionMode {
+    Live,
+    Simulate,
+}
+
+impl Default for ExecutionMode {
+    fn default() -> Self {
+        ExecutionMode::Live
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub port: u16,
@@ -28,6 +43,9 @@ pub struct Config {
     #[serde(deserialize_with = "whole_secs")]
     pub lease_wait_s: u64,
     pub excluded_agents: Vec<String>,
+    /// Owner-key dispatch mode. `simulate` keeps the old 2.4s stub (tests, dry runs).
+    #[serde(default)]
+    pub execution: ExecutionMode,
 }
 
 fn default_provider_rpm() -> std::collections::BTreeMap<String, usize> {
@@ -45,6 +63,7 @@ impl Default for Config {
             cooldown_s: 60,
             lease_wait_s: 30,
             excluded_agents: vec!["cline".to_string()],
+            execution: ExecutionMode::Live,
         }
     }
 }
@@ -123,6 +142,17 @@ mod tests {
         assert!(validate_config(&cfg).is_ok());
         assert_eq!(cfg.port, 8799);
         assert_eq!(cfg.max_inflight_per_key, 3);
+        assert_eq!(cfg.execution, ExecutionMode::Live);
+    }
+
+    #[test]
+    fn execution_mode_is_optional_and_lowercase() {
+        let json = r#"{"port":8799,"default_worker":"pi","max_inflight_per_key":3,
+            "rpm_per_key":40,"cooldown_s":60,"lease_wait_s":30,"excluded_agents":[]}"#;
+        let cfg: Config = serde_json::from_str(json).expect("missing execution must default");
+        assert_eq!(cfg.execution, ExecutionMode::Live);
+        let sim: Config = serde_json::from_str(&json.replace("\"excluded_agents\":[]", "\"excluded_agents\":[],\"execution\":\"simulate\"")).unwrap();
+        assert_eq!(sim.execution, ExecutionMode::Simulate);
     }
 
     #[test]

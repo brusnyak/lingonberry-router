@@ -45,46 +45,6 @@ interface WebsiteLandingProps {
   onHealJob: (name: string) => Promise<void> | void;
 }
 
-interface HudCallerNode {
-  id: string;
-  label: string;
-  sub: string;
-  startY: number;
-  targetWorker: string;
-  endY: number;
-  dotClass: string;
-}
-
-const HUD_CALLERS: HudCallerNode[] = [
-  {
-    id: 'claude',
-    label: 'claude',
-    sub: 'skill · systematic',
-    startY: 34,
-    targetWorker: 'pi:NIM_1',
-    endY: 34,
-    dotClass: 'bg-emerald-400',
-  },
-  {
-    id: 'codex',
-    label: 'codex',
-    sub: 'gate · worktree',
-    startY: 94,
-    targetWorker: 'groq:GROQ_API_KEY',
-    endY: 94,
-    dotClass: 'bg-amber-400',
-  },
-  {
-    id: 'opencode',
-    label: 'opencode',
-    sub: 'lease · 40 RPM',
-    startY: 154,
-    targetWorker: 'gemini:GEMINI_API_KEY',
-    endY: 154,
-    dotClass: 'bg-sky-400',
-  },
-];
-
 const MATRIX_ROWS: Array<{
   id: string;
   platform: 'macos' | 'linux' | 'windows';
@@ -173,36 +133,6 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
   onHealJob,
 }) => {
   const [matrixFilter, setMatrixFilter] = useState<MatrixPlatform>('all');
-  const [worktreeGateOn, setWorktreeGateOn] = useState(true);
-  const [activeCable, setActiveCable] = useState<{
-    d: string;
-    visible: boolean;
-    caller: string;
-    worker: string;
-  }>({
-    d: 'M 120 34 C 185 34, 185 94, 230 94 C 275 94, 275 34, 340 34',
-    visible: false,
-    caller: 'claude',
-    worker: 'pi:NIM_1',
-  });
-  const [hudLogs, setHudLogs] = useState<
-    Array<{ id: string; time: string; caller: string; worker: string; detail: string }>
-  >(() => [
-    {
-      id: 'seed-1',
-      time: new Date().toTimeString().slice(0, 8),
-      caller: 'claude',
-      worker: 'pi:NIM_1',
-      detail: 'cooked · systematic-debugging · gate ready',
-    },
-    {
-      id: 'seed-2',
-      time: new Date().toTimeString().slice(0, 8),
-      caller: 'codex',
-      worker: 'groq:GROQ_API_KEY',
-      detail: 'leased key · 3 max inflight / 40 RPM',
-    },
-  ]);
 
   const installSnippet = 'cargo install --path core && lingonberry-core init';
 
@@ -215,35 +145,11 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
     }
   };
 
-  const pulseRoute = (caller: string, worker: string, startY: number, endY: number, detail: string) => {
-    const d = `M 120 ${startY} C 185 ${startY}, 185 94, 230 94 C 275 94, 275 ${endY}, 340 ${endY}`;
-    setActiveCable({ d, visible: true, caller, worker });
-    const now = new Date().toTimeString().slice(0, 8);
-    setHudLogs((prev) => [
-      { id: `${Date.now()}-${Math.random()}`, time: now, caller, worker, detail },
-      ...prev.slice(0, 2),
-    ]);
-    setTimeout(() => {
-      setActiveCable((prev) => ({ ...prev, visible: false }));
-    }, 750);
-  };
-
   const handleSimulateBurst = () => {
-    HUD_CALLERS.forEach((item, idx) => {
-      setTimeout(() => {
-        pulseRoute(
-          item.label,
-          item.targetWorker,
-          item.startY,
-          item.endY,
-          worktreeGateOn ? 'fanout branch · --worktree gate' : 'fanout branch · leased'
-        );
-      }, idx * 200);
-    });
     void onFanout({
       prompt: 'Parallel audit: verify routes, key-pool leases, and cron watchdogs',
-      caller: 'claude',
-      worktree: worktreeGateOn,
+      caller: 'shell',
+      worktree: true,
     });
   };
 
@@ -255,36 +161,27 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
     [matrixFilter]
   );
 
-  const workerDisplayCards = useMemo(() => {
-    const slots = state.snapshot.workers;
-    const findSlot = (prov: string, fallbackName: string) =>
-      slots.find((w) => (w.provider || '').toLowerCase() === prov) ?? {
-        name: fallbackName,
-        status: 'idle' as const,
-        rpm_limit: 40,
-        ok_24h: 0,
-      };
-    const nim = findSlot('nim', 'pi:NIM_1');
-    const groq = findSlot('groq', 'groq:GROQ_API_KEY');
-    const gemini = findSlot('gemini', 'gemini:GEMINI_API_KEY');
-    return [
-      {
-        title: 'pi:NIM_1',
-        sub: `${nim.rpm_limit ?? 40} RPM · ${nim.ok_24h} ok`,
-        dot: nim.status === 'down' ? 'bg-amber-400' : 'bg-emerald-400',
-      },
-      {
-        title: 'groq:GROQ_API_KEY',
-        sub: `${groq.rpm_limit ?? 30} RPM · ${groq.ok_24h} ok`,
-        dot: groq.status === 'down' ? 'bg-amber-400' : 'bg-amber-400',
-      },
-      {
-        title: 'gemini:GEMINI_API_KEY',
-        sub: `${gemini.rpm_limit ?? 40} RPM · ${gemini.ok_24h} ok`,
-        dot: gemini.status === 'down' ? 'bg-amber-400' : 'bg-sky-400',
-      },
-    ];
-  }, [state.snapshot.workers]);
+  // Derived live data for the HUD: callers, live workers, recent sessions.
+  const callerNodes = useMemo(() => {
+    const seen = new Map<string, { id: string; label: string; sub: string; y: number }>();
+    let y = 34;
+    for (const s of state.snapshot.sessions) {
+      const c = s.caller ?? 'shell';
+      if (seen.has(c)) continue;
+      seen.set(c, { id: c, label: c, sub: s.state === 'running' || s.state === 'leased' ? 'active' : 'idle', y });
+      y += 60;
+    }
+    return Array.from(seen.values());
+  }, [state.snapshot.sessions]);
+
+  const liveWorkers = useMemo(() => state.snapshot.workers_live, [state.snapshot.workers_live]);
+
+  const recentSessions = useMemo(() => state.snapshot.sessions.slice(0, 5), [state.snapshot.sessions]);
+
+  const clock = (ts: number): string => {
+    const d = new Date(ts * 1000);
+    return Number.isNaN(d.getTime()) ? '--:--' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  };
 
   return (
     <div className="flex flex-col gap-16 pb-12">
@@ -377,12 +274,9 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
           </div>
         </div>
 
-        {/* Right Column: Precision Titanium Hardware & Interactive Orchestration HUD */}
+        {/* Right Column: Live Routing HUD */}
         <div className="lg:col-span-7 flex flex-col items-center">
           <div className="w-full max-w-[530px] rounded-2xl border border-zinc-200 dark:border-white/[0.1] bg-white dark:bg-[#11131b] shadow-lg dark:shadow-[0_20px_40px_-15px_rgba(0,0,0,0.7)] p-4 relative overflow-hidden">
-            {/* Subtle top bezel light strip */}
-            <div className="hidden dark:block absolute top-0 left-1/4 right-1/4 h-[1px] bg-gradient-to-r from-transparent via-[#fabb60]/50 to-transparent" />
-
             {/* Native Window Header Strip */}
             <div className="flex items-center justify-between pb-3 mb-3 border-b border-zinc-200 dark:border-white/[0.06]">
               <div className="flex items-center gap-2 min-w-0">
@@ -405,57 +299,33 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
               </span>
             </div>
 
-            {/* Dynamic SVG Routing HUD */}
-            <div className="bg-[#f8f9fb] dark:bg-[#06070a]/90 rounded-xl p-3 border border-zinc-200 dark:border-white/[0.06] relative flex flex-col">
+            {/* Live Flow Canvas */}
+            <div className="bg-zinc-900/30 dark:bg-white/[0.02] rounded-xl p-3 border border-zinc-200 dark:border-white/[0.06] relative flex flex-col">
               <div className="flex items-center justify-between mb-2 px-1">
                 <span className="text-[11px] font-mono text-zinc-600 dark:text-zinc-400 flex items-center gap-1.5">
                   <GitFork className="w-3.5 h-3.5 text-amber-600 dark:text-[#fabb60]" />
                   Live Routing Mesh
                 </span>
                 <span className="text-[10px] font-mono text-zinc-400 dark:text-zinc-500">
-                  Click callers to pulse
+                  Caller → Router → Workers
                 </span>
               </div>
 
-              {/* Visual Flow Canvas */}
               <div className="relative w-full h-[188px] bg-white dark:bg-black/45 rounded-lg overflow-hidden flex items-center justify-between px-3 py-2 border border-zinc-200 dark:border-white/[0.04]">
-                <svg
-                  className="absolute inset-0 w-full h-full pointer-events-none z-0"
-                  preserveAspectRatio="none"
-                  viewBox="0 0 460 188"
-                >
-                  <path
-                    d="M 120 34 C 185 34, 185 94, 230 94"
-                    fill="none"
-                    stroke="currentColor"
-                    className="text-zinc-300 dark:text-white/[0.09]"
-                    strokeDasharray="2 3"
-                    strokeWidth="1.2"
-                  />
-                  <path
-                    d="M 120 94 C 185 94, 185 94, 230 94"
-                    fill="none"
-                    stroke="currentColor"
-                    className="text-zinc-300 dark:text-white/[0.09]"
-                    strokeWidth="1.2"
-                  />
-                  <path
-                    d="M 120 154 C 185 154, 185 94, 230 94"
-                    fill="none"
-                    stroke="currentColor"
-                    className="text-zinc-300 dark:text-white/[0.09]"
-                    strokeDasharray="2 3"
-                    strokeWidth="1.2"
-                  />
+                <svg className="absolute inset-0 w-full h-full pointer-events-none z-0" preserveAspectRatio="none" viewBox="0 0 460 188">
+                  {callerNodes.map((n, i) => (
+                    <path
+                      key={`c-${i}`}
+                      d={`M 120 ${n.y} C 230 ${n.y}, 230 94, 340 94`}
+                      fill="none"
+                      stroke="currentColor"
+                      className="text-zinc-300 dark:text-white/[0.09]"
+                      strokeDasharray="2 3"
+                      strokeWidth="1.2"
+                    />
+                  ))}
                   <path
                     d="M 230 94 C 275 94, 275 34, 340 34"
-                    fill="none"
-                    stroke="currentColor"
-                    className="text-zinc-300 dark:text-white/[0.09]"
-                    strokeWidth="1.2"
-                  />
-                  <path
-                    d="M 230 94 C 275 94, 275 94, 340 94"
                     fill="none"
                     stroke="currentColor"
                     className="text-zinc-300 dark:text-white/[0.09]"
@@ -469,49 +339,28 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
                     strokeDasharray="2 3"
                     strokeWidth="1.2"
                   />
-
-                  <path
-                    d={activeCable.d}
-                    fill="none"
-                    stroke="#e5a950"
-                    strokeLinecap="round"
-                    strokeWidth="2.2"
-                    className={`transition-opacity duration-300 ${
-                      activeCable.visible ? 'opacity-100' : 'opacity-0'
-                    }`}
-                  />
                 </svg>
 
-                {/* Left: Callers */}
+                {/* Callers: who initiated work */}
                 <div className="z-10 flex flex-col gap-2 w-[112px]">
-                  {HUD_CALLERS.map((node) => (
+                  {callerNodes.length === 0 && (
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 text-center pt-4">No active callers</div>
+                  )}
+                  {callerNodes.map((n) => (
                     <button
-                      key={node.id}
+                      key={n.id}
                       type="button"
-                      onClick={() => {
-                        pulseRoute(
-                          node.label,
-                          node.targetWorker,
-                          node.startY,
-                          node.endY,
-                          `cook + key lease -> ${node.targetWorker}`
-                        );
-                        void onRoute({
-                          prompt: `Route check from ${node.label}`,
-                          caller: node.label,
-                          worktree: worktreeGateOn,
-                        });
-                      }}
-                      className="text-left px-2 py-1.5 rounded-lg bg-[#f8f9fb] dark:bg-[#151821]/95 hover:bg-zinc-100 dark:hover:bg-[#1c1f2b] border border-zinc-200 dark:border-white/[0.08] hover:border-amber-500/45 transition group"
+                      onClick={() => void onRoute({ prompt: `Route check from ${n.label}`, caller: n.label, worktree: true })}
+                      className="text-left px-2 py-1.5 rounded-lg border border-zinc-200 dark:border-white/[0.08] bg-zinc-100 dark:bg-white/[0.03] hover:bg-zinc-200 dark:hover:bg-white/[0.06] transition group"
                     >
                       <div className="flex items-center justify-between">
                         <span className="font-mono text-[10px] font-semibold text-zinc-800 dark:text-zinc-200 group-hover:text-amber-600 dark:group-hover:text-[#fabb60]">
-                          {node.label}
+                          {n.label}
                         </span>
-                        <span className={`w-1.5 h-1.5 rounded-full ${node.dotClass}`} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-500" />
                       </div>
                       <span className="text-[9px] font-mono text-zinc-500 dark:text-zinc-400 block mt-0.5 truncate">
-                        {node.sub}
+                        {n.sub}
                       </span>
                     </button>
                   ))}
@@ -523,9 +372,7 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
                     type="button"
                     onClick={handleSimulateBurst}
                     className={`w-14 h-14 rounded-2xl bg-white dark:bg-[#1c1f2b] border flex flex-col items-center justify-center shadow-md transition-transform duration-300 ${
-                      activeCable.visible
-                        ? 'scale-105 border-amber-500 dark:border-[#fabb60]'
-                        : 'border-amber-500/35 dark:border-[#fabb60]/30'
+                      state.snapshot.workers_live.length > 0 ? 'scale-105 border-amber-500 dark:border-[#fabb60]' : 'border-amber-500/35 dark:border-[#fabb60]/30'
                     }`}
                     title="Trigger fanout burst"
                   >
@@ -539,21 +386,21 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
                   </div>
                 </div>
 
-                {/* Right: Workers */}
+                {/* Workers: who executes */}
                 <div className="z-10 flex flex-col gap-2 w-[124px]">
-                  {workerDisplayCards.map((w) => (
-                    <div
-                      key={w.title}
-                      className="text-left px-2 py-1.5 rounded-lg bg-[#f8f9fb] dark:bg-[#151821]/95 border border-zinc-200 dark:border-white/[0.07]"
-                    >
+                  {liveWorkers.length === 0 && (
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 text-center pt-4">All workers idle</div>
+                  )}
+                  {liveWorkers.map((w) => (
+                    <div key={w.pid} className="text-left px-2 py-1.5 rounded-lg border border-zinc-200 dark:border-white/[0.08] bg-zinc-100 dark:bg-white/[0.03]">
                       <div className="flex items-center justify-between gap-1">
                         <span className="font-mono text-[9.5px] font-semibold text-zinc-800 dark:text-zinc-200 truncate">
-                          {w.title}
+                          {w.worker}
                         </span>
-                        <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${w.dot}`} />
+                        <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
                       </div>
                       <span className="text-[9px] font-mono text-zinc-500 dark:text-zinc-400 block mt-0.5 truncate">
-                        {w.sub}
+                        {w.task}
                       </span>
                     </div>
                   ))}
@@ -580,45 +427,28 @@ export const WebsiteLanding: React.FC<WebsiteLandingProps> = ({
                   <Filter className="w-3 h-3" />
                   <span>Inspect Gate</span>
                 </button>
-
-                <button
-                  type="button"
-                  onClick={() => {
-                    const next = !worktreeGateOn;
-                    setWorktreeGateOn(next);
-                    onShowToast(next ? 'Worktree gate enabled' : 'Worktree gate disabled');
-                  }}
-                  className="py-1.5 px-2.5 rounded-lg bg-white dark:bg-white/[0.04] hover:bg-zinc-100 dark:hover:bg-white/[0.08] text-zinc-600 dark:text-[#9ba1b4] font-mono text-[10px] flex items-center gap-1 transition border border-zinc-200 dark:border-white/[0.07]"
-                >
-                  <ShieldCheck className="w-3 h-3 text-emerald-600 dark:text-emerald-400" />
-                  <span>Worktree Gate: {worktreeGateOn ? 'ON' : 'OFF'}</span>
-                </button>
               </div>
             </div>
 
-            {/* Micro Trace Stream */}
-            <div className="mt-2.5 p-2.5 rounded-xl bg-[#f8f9fb] dark:bg-[#06070a]/90 border border-zinc-200 dark:border-white/[0.05] font-mono text-[10px]">
+            {/* Live Session Stream */}
+            <div className="mt-2.5 p-2.5 rounded-xl border border-zinc-200 dark:border-white/[0.06] bg-zinc-900/30 dark:bg-white/[0.02] font-mono text-[10px]">
               <div className="flex items-center justify-between text-zinc-500 dark:text-zinc-400 mb-1">
                 <span className="flex items-center gap-1.5">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
-                  <span>events.jsonl decision log</span>
+                  <span>Live sessions</span>
                 </span>
                 <span>{state.mode === 'live-api' ? 'live loopback' : 'static preview'}</span>
               </div>
-              <div className="flex flex-col gap-0.5 text-zinc-700 dark:text-zinc-300">
-                {hudLogs.map((log) => (
-                  <div key={log.id} className="truncate">
-                    [{log.time}] ROUTE{' '}
-                    <span className="text-amber-600 dark:text-[#fabb60] font-semibold">
-                      {log.caller}
-                    </span>{' '}
-                    →{' '}
-                    <span className="text-emerald-600 dark:text-emerald-400 font-semibold">
-                      {log.worker}
-                    </span>{' '}
-                    <span className="text-zinc-500 dark:text-zinc-400">({log.detail})</span>
-                  </div>
-                ))}
+              <div className="flex flex-col gap-0.5 text-zinc-700 dark:text-zinc-300 max-h-24 overflow-y-auto">
+                {recentSessions.length === 0 ? (
+                  <div className="text-zinc-500 dark:text-zinc-500">No sessions yet</div>
+                ) : (
+                  recentSessions.map((s) => (
+                    <div key={s.id} className="truncate">
+                      [{clock(s.ts)}] <span className="text-amber-600 dark:text-[#fabb60] font-semibold">{s.caller ?? 'shell'}</span> → <span className="text-emerald-600 dark:text-emerald-400 font-semibold">{s.worker}</span>
+                    </div>
+                  ))
+                )}
               </div>
             </div>
           </div>

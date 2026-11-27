@@ -1,82 +1,92 @@
 import Foundation
-import Combine
 
-@MainActor
-final class RouterClient: ObservableObject {
-    @Published var snapshot: Snapshot?
-    @Published var connected: Bool = false
-    @Published var lastError: String?
+actor RouterClient {
+    private let baseURL: URL
+    private let session: URLSession
 
-    private let baseURL = URL(string: "http://127.0.0.1:8799")!
-    private var timer: Timer?
-    private var coreProcess: Process?
-
-    func start() {
-        ensureDaemonRunning()
-        Task { await refresh() }
-        timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                await self?.refresh()
-            }
-        }
+    init(baseURL: URL = URL(string: "http://127.0.0.1:8799")!) {
+        self.baseURL = baseURL
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 5
+        config.timeoutIntervalForResource = 10
+        self.session = URLSession(configuration: config)
     }
 
-    func stop() {
-        timer?.invalidate()
-        timer = nil
-        if let proc = coreProcess, proc.isRunning {
-            proc.terminate()
-        }
+    func snapshot() async throws -> Snapshot {
+        let url = baseURL.appendingPathComponent("/api/snapshot")
+        let (data, _) = try await session.data(from: url)
+        return try JSONDecoder().decode(Snapshot.self, from: data)
     }
 
-    private func ensureDaemonRunning() {
-        Task {
-            do {
-                let (_, response) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("version"))
-                if (response as? HTTPURLResponse)?.statusCode == 200 { return }
-            } catch {
-                // Attempt to spawn local lingonberry-core binary on macOS
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-                proc.arguments = ["lingonberry-core", "serve", "127.0.0.1:8799"]
-                proc.standardInput = FileHandle.nullDevice
-                proc.standardOutput = FileHandle.nullDevice
-                proc.standardError = FileHandle.nullDevice
-                try? proc.run()
-                coreProcess = proc
-            }
-        }
+    func version() async throws -> VersionResp {
+        let url = baseURL.appendingPathComponent("/version")
+        let (data, _) = try await session.data(from: url)
+        return try JSONDecoder().decode(VersionResp.self, from: data)
     }
 
-    func refresh() async {
-        do {
-            let (data, response) = try await URLSession.shared.data(from: baseURL.appendingPathComponent("snapshot"))
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else {
-                connected = false
-                return
-            }
-            snapshot = try JSONDecoder().decode(Snapshot.self, from: data)
-            connected = true
-            lastError = nil
-        } catch {
-            connected = false
-            lastError = error.localizedDescription
-        }
+    func discover() async throws -> DiscoverData {
+        let url = baseURL.appendingPathComponent("/api/discover")
+        let (data, _) = try await session.data(from: url)
+        return try JSONDecoder().decode(DiscoverData.self, from: data)
     }
 
-    func postAction(_ path: String) async {
-        var req = URLRequest(url: baseURL.appendingPathComponent(path))
+    func keys() async throws -> [KeyStatus] {
+        let url = baseURL.appendingPathComponent("/api/keys")
+        let (data, _) = try await session.data(from: url)
+        return try JSONDecoder().decode([KeyStatus].self, from: data)
+    }
+
+    func runs() async throws -> [RunRow] {
+        let url = baseURL.appendingPathComponent("/api/runs")
+        let (data, _) = try await session.data(from: url)
+        return try JSONDecoder().decode([RunRow].self, from: data)
+    }
+
+    func route(prompt: String, phase: String = "plan", caller: String? = nil) async throws -> Receipt {
+        var url = baseURL.appendingPathComponent("/api/route")
+        var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        _ = try? await URLSession.shared.data(for: req)
-        await refresh()
+        var body: [String: Any] = ["prompt": prompt, "phase": phase]
+        if let caller = caller { body["caller"] = caller }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, _) = try await session.data(for: req)
+        return try JSONDecoder().decode(Receipt.self, from: data)
     }
 
-    func killWorker(pid: UInt32) async { await postAction("kill/\(pid)") }
-    func killCronPid(pid: UInt32) async { await postAction("api/jobs/kill/\(pid)") }
-    func toggleJob(name: String) async { await postAction("api/jobs/\(name)/toggle") }
-    func runJob(name: String) async { await postAction("api/jobs/\(name)/run") }
-    func healJob(name: String) async { await postAction("api/jobs/\(name)/heal") }
-    func toggleWatchdog(name: String) async { await postAction("api/jobs/\(name)/watchdog") }
-    func rescan() async { await postAction("api/rescan") }
+    func run(prompt: String, worker: String? = nil, caller: String? = nil, liveApi: Bool = false) async throws -> RunRow {
+        var url = baseURL.appendingPathComponent("/api/run")
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = ["prompt": prompt]
+        if let worker = worker { body["worker"] = worker }
+        if let caller = caller { body["caller"] = caller }
+        if liveApi { body["live_api"] = true }
+        req.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, _) = try await session.data(for: req)
+        let response = try JSONDecoder().decode(RunResponse.self, from: data)
+        return response.run
+    }
+}
+
+struct DiscoverData: Codable {
+    let agents: [AgentInfo]
+    let keys: [String: [String]]
+    let providers: [String: ProviderInfo]
+    let library_dirs: [String]
+    let ssh_hosts: [String]
+    let git_projects: [String]
+    let browsers: [String]
+}
+
+struct AgentInfo: Codable {
+    let id: String
+    let path: String?
+}
+
+struct ProviderInfo: Codable {
+    let id: String
+    let base_url: String
+    let style: String?
 }

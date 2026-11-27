@@ -58,6 +58,16 @@ impl LeaseGuard {
             .release_key(&self.key_name, ok, cooldown_override_s);
         self.released = true;
     }
+
+    /// Release the leased inflight slot without counting ok/fail or cooling. For paths where a
+    /// key was leased but never actually called (e.g. no executor handled the worker), so a
+    /// healthy key is not penalized for work that never happened.
+    pub fn cancel(mut self) {
+        if let Some(k) = self.registry.inner.lock().unwrap().keys.get_mut(&self.key_name) {
+            k.inflight = k.inflight.saturating_sub(1);
+        }
+        self.released = true;
+    }
 }
 
 impl Drop for LeaseGuard {
@@ -172,6 +182,74 @@ impl Registry {
             .cloned()
     }
 
+    /// Free dispatch slots for a provider right now, from an already-held lock.
+    fn headroom_in(inner: &RegistryInner, provider: &str, now: f64) -> usize {
+        inner
+            .keys
+            .values()
+            .filter(|k| k.provider == provider)
+            .map(|k| {
+                if now < k.cooling_until {
+                    return 0;
+                }
+                let rpm = inner
+                    .provider_rpm_caps
+                    .get(&k.provider)
+                    .copied()
+                    .unwrap_or(inner.rpm_limit);
+                let used = k.window.iter().filter(|t| now - **t <= 60.0).count();
+                let rpm_free = rpm.saturating_sub(used);
+                let inflight_free = inner.max_inflight.saturating_sub(k.inflight);
+                rpm_free.min(inflight_free)
+            })
+            .sum()
+    }
+
+    /// Free dispatch slots for a provider right now: sum over its keys of
+    /// min(remaining calls in the 60s window, inflight headroom). Cooling keys count 0.
+    /// Used to spread owner traffic across providers instead of pinning the first one.
+    pub fn provider_headroom(&self, provider: &str) -> usize {
+        let guard = self.inner.lock().unwrap();
+        Self::headroom_in(&guard, provider, now_sec())
+    }
+
+    pub fn default_worker(&self) -> String {
+        self.inner.lock().unwrap().default_worker.clone()
+    }
+
+    /// The pi worker with the most free key slots, skipping `exclude`. Used as the default
+    /// executor for owner keys and as a lease-time failover when routing raced the pool.
+    pub fn select_best_worker_excluding(&self, exclude: Option<&str>) -> Option<DiscoveredWorker> {
+        let guard = self.inner.lock().unwrap();
+        let now = now_sec();
+        let mut best: Option<(usize, DiscoveredWorker)> = None;
+        for w in guard.workers.iter() {
+            if guard.down_workers.contains(&w.id) {
+                continue;
+            }
+            if exclude == Some(w.id.as_str()) {
+                continue;
+            }
+            let eligible = (w.agent == "pi" && w.key_name.is_none())
+                || w.key_name.is_some();
+            if !eligible {
+                continue;
+            }
+            let headroom = Self::headroom_in(&guard, &w.provider, now);
+            if headroom == 0 {
+                continue;
+            }
+            let better = match &best {
+                None => true,
+                Some((h, b)) => headroom > *h || (headroom == *h && w.id < b.id),
+            };
+            if better {
+                best = Some((headroom, w.clone()));
+            }
+        }
+        best.map(|(_, w)| w)
+    }
+
     pub fn mark_worker_down(&self, worker_id: &str, down: bool) {
         let mut guard = self.inner.lock().unwrap();
         if down {
@@ -186,6 +264,10 @@ impl Registry {
     }
 
     pub fn select_best_worker(&self) -> Option<DiscoveredWorker> {
+        // Owner-key dispatch goes to whichever provider has the most free key slots.
+        if let Some(w) = self.select_best_worker_excluding(None) {
+            return Some(w);
+        }
         let guard = self.inner.lock().unwrap();
         let available: Vec<&DiscoveredWorker> = guard
             .workers
@@ -193,16 +275,13 @@ impl Registry {
             .filter(|w| !guard.down_workers.contains(&w.id))
             .collect();
 
+        // Preference order:
+        // 1. pi workers (agent == "pi", no key slot) — external API calls, no local process
+        // 2. Local CLI workers with no key slot (claude, codex, opencode, kilo, omp)
+        // 3. Any available worker
         available
             .iter()
-            .find(|w| {
-                w.id == guard.default_worker && (w.key_name.is_none() || w.agent == "pi")
-            })
-            .or_else(|| {
-                available
-                    .iter()
-                    .find(|w| w.agent == "pi" && w.key_name.is_none())
-            })
+            .find(|w| w.agent == "pi" && w.key_name.is_none())
             .or_else(|| available.iter().find(|w| w.key_name.is_none()))
             .or_else(|| available.first())
             .map(|w| (*w).clone())

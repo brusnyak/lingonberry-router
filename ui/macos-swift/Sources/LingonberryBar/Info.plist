@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
-	<string>en</string>
+	<string>English</string>
+	<key>CFBundleDisplayName</key>
+	<string>Lingonberry Router</string>
 	<key>CFBundleExecutable</key>
-	<string>LingonberryBar</string>
-	<key>CFBundleIconFile</key>
-	<string>lingonberry-icon</string>
+	<string>lingonberry-tray</string>
 	<key>CFBundleIdentifier</key>
 	<string>dev.lingonberry.router</string>
 	<key>CFBundleInfoDictionaryVersion</key>
@@ -17,14 +17,18 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>0.1.0</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0.1.0</string>
+	<key>CFBundleIconFile</key>
+	<string>icon</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>10.15</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 	<key>LSUIElement</key>
 	<true/>
-	<key>NSHumanReadableCopyright</key>
-	<string>© 2026 Lingonberry Router</string>
-	<key>NSPrincipalClass</key>
-	<string>NSApplication</string>
 </dict>
 </plist>

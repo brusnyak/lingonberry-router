@@ -3,20 +3,16 @@ import PackageDescription
 
 let package = Package(
     name: "LingonberryBar",
-    platforms: [
-        .macOS(.v14)
-    ],
+    platforms: [.macOS(.v14)],
     products: [
-        .executable(name: "LingonberryBar", targets: ["LingonberryBar"])
+        .executable(name: "lingonberry-tray", targets: ["LingonberryBar"]),
     ],
+    dependencies: [],
     targets: [
         .executableTarget(
             name: "LingonberryBar",
             path: "Sources/LingonberryBar",
-            linkerSettings: [
-                .linkedFramework("AppKit"),
-                .linkedFramework("SwiftUI"),
-            ]
-        )
+            resources: [.copy("Resources")]
+        ),
     ]
 )

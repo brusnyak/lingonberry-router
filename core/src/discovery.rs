@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 pub const PI_NIM_MODEL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 
 const AGENT_BINS: &[&str] = &[
-    "claude", "codex", "opencode", "kilo", "pi", "cline", "goose", "omp", "hermes",
+    "claude", "codex", "opencode", "kilo", "cline", "goose", "omp", "hermes",
     "crush", "qwen",
 ];
 
@@ -67,7 +67,7 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
         "groq" => Some((
             "https://api.groq.com/openai/v1",
             Some("openai-completions"),
-            Some("llama-3.1-8b-instant"),
+            Some("qwen/qwen3.8-27b"),
         )),
         "anthropic" => Some((
             "https://api.anthropic.com/v1",
