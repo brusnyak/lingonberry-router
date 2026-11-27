@@ -10,8 +10,11 @@ struct LingonberryBarApp: App {
         MenuBarExtra {
             PopoverView(store: delegate.store)
         } label: {
-            let iconPath = Bundle.main.path(forResource: "icon", ofType: "icns") ?? ""
-            let appIcon = NSImage(contentsOfFile: iconPath) ?? NSImage()
+            let appIcon: NSImage = {
+                let img = NSImage(named: "icon") ?? NSImage(size: NSSize(width: 16, height: 16))
+                img.size = NSSize(width: 16, height: 16)
+                return img
+            }()
             Image(nsImage: appIcon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)

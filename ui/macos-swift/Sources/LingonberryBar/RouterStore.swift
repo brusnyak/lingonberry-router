@@ -31,6 +31,10 @@ final class RouterStore: ObservableObject {
     }
 
     private var retryCount: Int = 0
+    /// True while we're still in the initial startup retry window — suppress
+    /// the error banner so the user doesn't see "data missing" while core
+    /// finishes launching.
+    private var isInitialStartup: Bool = true
 
     func refresh() async {
         guard !isRefreshing else { return }
@@ -43,22 +47,30 @@ final class RouterStore: ObservableObject {
             self.isRouterUp = true
             self.lastError = nil
             self.retryCount = 0
+            self.isInitialStartup = false
         } catch {
             let msg = "RouterStore.refresh failed: \(error.localizedDescription)\n"
             FileHandle.standardError.write(msg.data(using: .utf8)!)
 
-            // Only mark router down and show error if we never connected successfully.
+            // Only mark router down if we never connected successfully.
             // If we already have snapshot data, this is a transient failure — keep
             // isRouterUp true and clear the banner so the user sees stale-but-real data.
             if self.snapshot == nil {
                 self.isRouterUp = false
-                self.lastError = error.localizedDescription
-                // Retry with short backoff on first-time failures until core is up.
-                self.retryCount += 1
-                if self.retryCount <= 5 {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-                        Task { await self.refresh() }
+                // During initial startup, don't show a banner — just retry silently.
+                // Only surface the error once retries are exhausted.
+                if self.isInitialStartup {
+                    self.retryCount += 1
+                    if self.retryCount <= 5 {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
+                            Task { await self.refresh() }
+                        }
+                    } else {
+                        self.lastError = error.localizedDescription
+                        self.isInitialStartup = false
                     }
+                } else {
+                    self.lastError = error.localizedDescription
                 }
             } else {
                 self.lastError = nil

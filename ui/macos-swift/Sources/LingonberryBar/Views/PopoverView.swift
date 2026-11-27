@@ -236,104 +236,110 @@ struct GraphView: View {
             .padding(.top, 14)
             .padding(.bottom, 10)
 
-            GeometryReader { geo in
-                let w = geo.size.width
-                let h = geo.size.height
-                let midY = h / 2
-                let centerX = w / 2
-                let badgeW: CGFloat = 140
+            // Modal-style graph panel: dark background, border, dedicated space
+            VStack(spacing: 0) {
+                GeometryReader { geo in
+                    let w = geo.size.width
+                    let h = geo.size.height
+                    let midY = h / 2
+                    let centerX = w / 2
+                    let badgeW: CGFloat = 140
 
-                ZStack {
-                    RoundedRectangle(cornerRadius: 16)
-                        .fill(Theme.bg)
+                    ZStack {
+                        // Panel background
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(Theme.card)
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(Theme.border, lineWidth: 1)
 
-                    if !isIdle {
-                        // Curved lines: left callers → center
-                        ForEach(0..<activeCallers.count, id: \.self) { i in
-                            let caller = activeCallers[i]
-                            let y = h * CGFloat(i + 1) / CGFloat(activeCallers.count + 1)
-                            let start = CGPoint(x: 90, y: y)
-                            let end = CGPoint(x: centerX - badgeW / 2, y: midY)
-                            Path { p in
-                                p.move(to: start)
-                                let dx = (end.x - start.x) * 0.5
-                                p.addCurve(to: end,
-                                           control1: CGPoint(x: start.x + dx, y: start.y),
-                                           control2: CGPoint(x: end.x - dx, y: end.y))
+                        if !isIdle {
+                            // Curved lines: left callers → center
+                            ForEach(0..<activeCallers.count, id: \.self) { i in
+                                let caller = activeCallers[i]
+                                let y = h * CGFloat(i + 1) / CGFloat(activeCallers.count + 1)
+                                let start = CGPoint(x: 90, y: y)
+                                let end = CGPoint(x: centerX - badgeW / 2, y: midY)
+                                Path { p in
+                                    p.move(to: start)
+                                    let dx = (end.x - start.x) * 0.5
+                                    p.addCurve(to: end,
+                                               control1: CGPoint(x: start.x + dx, y: start.y),
+                                               control2: CGPoint(x: end.x - dx, y: end.y))
+                                }
+                                .stroke(Color(0x6b5d63).opacity(0.5), lineWidth: 2)
                             }
-                            .stroke(Color(0x6b5d63).opacity(0.5), lineWidth: 2)
-                        }
 
-                        // Curved lines: center → right workers
-                        ForEach(Array(liveWorkersList.enumerated()), id: \.offset) { i, worker in
-                            let y = h * CGFloat(i + 1) / CGFloat(liveWorkersList.count + 1)
-                            let start = CGPoint(x: centerX + badgeW / 2, y: midY)
-                            let end = CGPoint(x: w - 90, y: y)
-                            let color = providerColor(worker.provider)
-                            Path { p in
-                                p.move(to: start)
-                                let dx = (end.x - start.x) * 0.5
-                                p.addCurve(to: end,
-                                           control1: CGPoint(x: start.x + dx, y: start.y),
-                                           control2: CGPoint(x: end.x - dx, y: end.y))
+                            // Curved lines: center → right workers
+                            ForEach(Array(liveWorkersList.enumerated()), id: \.offset) { i, worker in
+                                let y = h * CGFloat(i + 1) / CGFloat(liveWorkersList.count + 1)
+                                let start = CGPoint(x: centerX + badgeW / 2, y: midY)
+                                let end = CGPoint(x: w - 90, y: y)
+                                let color = providerColor(worker.provider)
+                                Path { p in
+                                    p.move(to: start)
+                                    let dx = (end.x - start.x) * 0.5
+                                    p.addCurve(to: end,
+                                               control1: CGPoint(x: start.x + dx, y: start.y),
+                                               control2: CGPoint(x: end.x - dx, y: end.y))
+                                }
+                                .stroke(color.opacity(0.55), lineWidth: 3)
                             }
-                            .stroke(color.opacity(0.55), lineWidth: 3)
+
+                            // Left caller nodes
+                            ForEach(Array(activeCallers.enumerated()), id: \.offset) { i, caller in
+                                let y = h * CGFloat(i + 1) / CGFloat(activeCallers.count + 1)
+                                GraphNodeView(
+                                    node: GraphNode(
+                                        id: caller,
+                                        label: caller,
+                                        icon: callerIcon(caller),
+                                        color: Theme.ok
+                                    ),
+                                    at: CGPoint(x: 60, y: y),
+                                    alignment: .leading
+                                )
+                            }
+
+                            // Right worker nodes — colored by provider
+                            ForEach(Array(liveWorkersList.enumerated()), id: \.offset) { i, worker in
+                                let y = h * CGFloat(i + 1) / CGFloat(liveWorkersList.count + 1)
+                                GraphNodeView(
+                                    node: GraphNode(
+                                        id: worker.worker,
+                                        label: worker.worker,
+                                        icon: workerIcon(worker.worker),
+                                        color: providerColor(worker.provider)
+                                    ),
+                                    at: CGPoint(x: w - 60, y: y),
+                                    alignment: .trailing
+                                )
+                            }
                         }
 
-                        // Left caller nodes
-                        ForEach(Array(activeCallers.enumerated()), id: \.offset) { i, caller in
-                            let y = h * CGFloat(i + 1) / CGFloat(activeCallers.count + 1)
-                            GraphNodeView(
-                                node: GraphNode(
-                                    id: caller,
-                                    label: caller,
-                                    icon: callerIcon(caller),
-                                    color: Theme.ok
-                                ),
-                                at: CGPoint(x: 60, y: y),
-                                alignment: .leading
-                            )
+                        // Center badge: Router Dispatch
+                        VStack(spacing: 4) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 12)
+                                    .fill(isIdle ? Theme.textDim.opacity(0.12) : Theme.accent.opacity(0.15))
+                                RoundedRectangle(cornerRadius: 12)
+                                    .stroke(isIdle ? Theme.textDim : Theme.accent, lineWidth: 1.5)
+                                Image(systemName: "network")
+                                    .font(.system(size: 20, weight: .medium))
+                                    .foregroundStyle(isIdle ? Theme.textDim : Theme.accent)
+                            }
+                            .frame(width: 56, height: 56)
+                            Text("Router")
+                                .font(mono(12, .semibold))
+                                .foregroundStyle(Theme.text)
+                            Text("Dispatch")
+                                .font(mono(10, .medium))
+                                .foregroundStyle(Theme.textMuted)
                         }
-
-                        // Right worker nodes — colored by provider
-                        ForEach(Array(liveWorkersList.enumerated()), id: \.offset) { i, worker in
-                            let y = h * CGFloat(i + 1) / CGFloat(liveWorkersList.count + 1)
-                            GraphNodeView(
-                                node: GraphNode(
-                                    id: worker.worker,
-                                    label: worker.worker,
-                                    icon: workerIcon(worker.worker),
-                                    color: providerColor(worker.provider)
-                                ),
-                                at: CGPoint(x: w - 60, y: y),
-                                alignment: .trailing
-                            )
-                        }
+                        .position(x: centerX, y: midY)
                     }
-
-                    // Center badge: Router Dispatch
-                    VStack(spacing: 4) {
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(isIdle ? Theme.textDim.opacity(0.12) : Theme.accent.opacity(0.15))
-                            RoundedRectangle(cornerRadius: 12)
-                                .stroke(isIdle ? Theme.textDim : Theme.accent, lineWidth: 1.5)
-                            Image(systemName: "network")
-                                .font(.system(size: 20, weight: .medium))
-                                .foregroundStyle(isIdle ? Theme.textDim : Theme.accent)
-                        }
-                        .frame(width: 56, height: 56)
-                        Text("Router")
-                            .font(mono(12, .semibold))
-                            .foregroundStyle(Theme.text)
-                        Text("Dispatch")
-                            .font(mono(10, .medium))
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                    .position(x: centerX, y: midY)
+                    .frame(height: 300)
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(height: 260)
-                .frame(maxWidth: .infinity)
             }
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
