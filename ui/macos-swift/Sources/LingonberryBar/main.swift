@@ -1,7 +1,6 @@
 import SwiftUI
 import AppKit
 import Foundation
-import Network
 
 @main
 struct LingonberryBarApp: App {
@@ -41,21 +40,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     /// Returns true if the core HTTP API is already responding to /api/snapshot.
-    /// Non-blocking TCP check on a background queue — never blocks the main run loop.
+    /// Uses a background URLSession delegate queue so the completion handler can
+    /// fire even while the main thread is blocked on the semaphore — never
+    /// deadlocks the main run loop, and no DispatchGroup means no unbalanced leave.
     private func coreIsRunning() -> Bool {
+        guard let url = URL(string: "http://127.0.0.1:8799/api/snapshot") else { return false }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 1.0
+
+        let semaphore = DispatchSemaphore(value: 0)
         var result = false
-        let group = DispatchGroup()
-        group.enter()
-        let host = NWEndpoint.Host("127.0.0.1")
-        let port = NWEndpoint.Port(integerLiteral: 8799)
-        let conn = NWConnection(host: host, port: port, using: .tcp)
-        conn.stateUpdateHandler = { state in
-            if case .ready = state { result = true }
-            conn.cancel()
-            group.leave()
+
+        let session = URLSession(configuration: .ephemeral, delegate: nil, delegateQueue: OperationQueue())
+        let task = session.dataTask(with: request) { _, response, _ in
+            result = (response as? HTTPURLResponse)?.statusCode == 200
+            semaphore.signal()
         }
-        conn.start(queue: DispatchQueue.global())
-        return group.wait(timeout: .now() + 0.5) == .success && result
+        task.resume()
+        return semaphore.wait(timeout: .now() + 1.0) == .success && result
     }
 
     /// Launch the bundled core backend if it isn't already running.
