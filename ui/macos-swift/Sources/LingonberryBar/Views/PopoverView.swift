@@ -1052,8 +1052,8 @@ struct SessionRowView: View {
     let expanded: Bool
     var onToggle: () -> Void
 
-    @State private var showPipeline: Bool = false
-    @State private var copiedOutput: Bool = false
+    @ViewState private var showPipeline: Bool = false
+    @ViewState private var copiedOutput: Bool = false
     @Environment(\.colorScheme) private var colorScheme
 
     private var theme: ThemePalette { ThemePalette(colorScheme: colorScheme) }

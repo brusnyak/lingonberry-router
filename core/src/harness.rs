@@ -349,7 +349,9 @@ pub fn execute_verification_gate(gate_spec: Option<&str>, cwd: &Path) -> GateOut
                 String::from_utf8_lossy(&out.stderr)
             );
             let tail: String = redact_secrets(combined.trim()).chars().take(400).collect();
-            if out.status.success() {
+            // `git status --porcelain` exits 0 on a dirty tree; any output means not clean.
+            let dirty = spec == "git-clean" && !out.stdout.is_empty();
+            if out.status.success() && !dirty {
                 GateOutcome {
                     status: "passed",
                     passed: Some(true),
@@ -373,6 +375,24 @@ pub fn execute_verification_gate(gate_spec: Option<&str>, cwd: &Path) -> GateOut
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn git_clean_gate_fails_on_dirty_repo() {
+        let dir = std::env::temp_dir().join(format!("lb-gate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success());
+        let clean = super::execute_verification_gate(Some("git-clean"), &dir);
+        std::fs::write(dir.join("dirty"), "x").unwrap();
+        let dirty = super::execute_verification_gate(Some("git-clean"), &dir);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(clean.passed, Some(true));
+        assert_eq!(dirty.passed, Some(false));
+    }
+
     use super::*;
 
     #[test]

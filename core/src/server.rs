@@ -24,7 +24,7 @@ use crate::sandbox::{
     SandboxTier,
 };
 use crate::spec_engine::{
-    check_diff_scope_guard, create_draft_spec, load_matching_steering, KiroSpecManifest,
+    check_diff_scope_guard, create_draft_spec, load_matching_steering,
     SpecWaveTask,
 };
 use crate::storage::SqliteStore;

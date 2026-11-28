@@ -1,31 +1,35 @@
 import SwiftUI
 
+// The Command Line Tools toolchain cannot load SwiftUIMacros, so `@State` fails to build.
+// The alias names the property-wrapper struct directly. Use `@ViewState`, not `@State`.
+typealias ViewState = SwiftUI.State
+
 struct SetupPanelView: View {
     @ObservedObject var store: RouterStore
     @Environment(\.colorScheme) private var colorScheme
 
     // Keychain add form
-    @State private var provider: String = "nim"
-    @State private var label: String = "default"
-    @State private var apiKey: String = ""
-    @State private var costTier: String = "free_tier"
-    @State private var baseUrl: String = ""
-    @State private var model: String = ""
-    @State private var rpmLimitText: String = "30"
+    @ViewState private var provider: String = "nim"
+    @ViewState private var label: String = "default"
+    @ViewState private var apiKey: String = ""
+    @ViewState private var costTier: String = "free_tier"
+    @ViewState private var baseUrl: String = ""
+    @ViewState private var model: String = ""
+    @ViewState private var rpmLimitText: String = "30"
 
     // Self-config target selection
-    @State private var selectedTargets: Set<String> = []
-    @State private var didSeedTargets: Bool = false
+    @ViewState private var selectedTargets: Set<String> = []
+    @ViewState private var didSeedTargets: Bool = false
 
     // Overnight & Kiro Spec form
-    @State private var budgetUsdText: String = "0"
-    @State private var maxRunsText: String = "5"
-    @State private var didSeedOvernight: Bool = false
-    @State private var specTitle: String = ""
-    @State private var specGoal: String = ""
-    @State private var specGlobs: String = "core/src/**"
-    @State private var specGate: String = "test"
-    @State private var specSandbox: String = "docker"
+    @ViewState private var budgetUsdText: String = "0"
+    @ViewState private var maxRunsText: String = "5"
+    @ViewState private var didSeedOvernight: Bool = false
+    @ViewState private var specTitle: String = ""
+    @ViewState private var specGoal: String = ""
+    @ViewState private var specGlobs: String = "core/src/**"
+    @ViewState private var specGate: String = "test"
+    @ViewState private var specSandbox: String = "docker"
 
     private var theme: ThemePalette { ThemePalette(colorScheme: colorScheme) }
 

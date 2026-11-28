@@ -12,6 +12,7 @@ let package = Package(
         .executableTarget(
             name: "LingonberryBar",
             path: "Sources/LingonberryBar",
+            exclude: ["Info.plist"],
             resources: [.copy("Resources")]
         ),
     ]
