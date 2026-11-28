@@ -2,15 +2,14 @@
 
 # Lingonberry Router
 
-**One local, cross-OS router for every AI agent on your machine.**  
-Scan once, self-configure globally through your shared skills and constitution, cook raw prompts into verified dispatches, lease provider keys safely, and oversee live workers from a clean menu bar.
+**One local reasoning router for coding agents and free/local model pools on macOS.**  
+Verify `pi-rust`, store keys safely in macOS Keychain, cook prompts through an embedded mini-harness, enforce worktree & gate verification, and supervise active runs from a calm SwiftUI menu bar.
 
-[Website](https://lingonberry-router.vercel.app) · [Install](#install) · [Architecture](#architecture) · [Global Self-Config](#global-first-self-configuration) · [CLI](#cli) · [HTTP API](#http-api) · [Known Gaps](#known-gaps)
+[Install](#install) · [Architecture](#architecture) · [Self-Config & Mini-Harness](#self-configuration--mini-harness) · [CLI](#cli) · [HTTP API](#http-api)
 
-[![CI](https://github.com/brusnyak/lingonberry-router/actions/workflows/ci.yml/badge.svg)](https://github.com/brusnyak/lingonberry-router/actions/workflows/ci.yml)
 ![Rust](https://img.shields.io/badge/core-Rust-orange)
-![Cross-OS](https://img.shields.io/badge/OS-macOS%20%7C%20Linux%20%7C%20Windows-blue)
-![Local only](https://img.shields.io/badge/network-loopback%20only-green)
+![macOS](https://img.shields.io/badge/UI-SwiftUI%20MenuBar-blue)
+![Local only](https://img.shields.io/badge/network-loopback%20%2B%20bearer%20token-green)
 
 </div>
 
@@ -20,11 +19,11 @@ Scan once, self-configure globally through your shared skills and constitution, 
 
 | Without Lingonberry Router | With Lingonberry Router |
 |---|---|
-| Each agent manages its own API keys and prompts | Keys stay in `~/.env` or `~/.config/lingonberry/env`; the router leases slot names only |
-| Updating routing rules across 5+ CLIs is repetitive | Global-first self-config writes one shared skill + constitution and light per-agent pointers |
-| Long, raw prompts run without matching skills or retrieval | Prompts are cooked with matching skills, commands, hooks, and workspace context first |
-| One runaway agent can burn a shared quota | Provider-scoped key pool enforces 3 concurrent runs and 40 calls/min per slot |
-| Stuck child processes and cron jobs stay invisible | Cross-OS menu bar shows `Caller → Router → Worker (Key Slot) → Gate/Outcome`, live PIDs, Kill, and Cron Jobs |
+| Raw provider keys copied into `~/.pi/agent/auth.json` or scripts | Keys stay in macOS Keychain (`kc:*`) or `~/.env`; `pi-rust` hits Lingonberry's authenticated `/v1/chat/completions` proxy |
+| Discovered host `launchd`/`cron` entries look indistinguishable or unsafe | Host jobs are monitored strictly read-only (`scope = "discovered"`); never dispatched as LLM calls |
+| Agents mutate your main working tree without checks | `--worktree` isolates runs in a real `git worktree` and `--gate` runs real `test`/`build`/`gitleaks` checks |
+| Metered paid APIs burn budget silently | Keys are classified (`local`, `free_tier`, `metered_paid`); paid tiers block unless `--approve` is given |
+| No starter skills/loops on a fresh machine | Built-in mini-harness seeds starter skills and Task Ledger workflows under `~/.lingonberry/harness/skills` |
 
 ---
 
@@ -32,93 +31,79 @@ Scan once, self-configure globally through your shared skills and constitution, 
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    C[Caller<br/>claude · codex · opencode · shell] -->|raw prompt| R
-    subgraph R[Lingonberry Router · 127.0.0.1:8799]
-        direction TB
-        S[Scan PATH, Env Keys & Global Skills] --> K[Cook Prompt<br/>Skill · Command · Hook · Retrieval]
-        K --> F[Constraint-First Route & Receipt]
-        F --> L[Provider-Scoped KeyPool Lease]
-    end
-    L -->|dispatch| W[Worker & Key Slot<br/>pi:NIM_1 · groq · gemini · claude]
-    W -->|output / worktree diff| G[Gate & Outcome<br/>Evidence Gate · SQLite · events.jsonl]
-    R -.->|GET /snapshot · POST /kill/pid| M[Cross-OS Menu Bar / Tray<br/>Graph · Live Processes · Cron Jobs]
-```
-
-1. **Discover & Self-Configure.** `lingonberry-core init` scans `PATH` for agent CLIs, env files for key *names*, and shared global skill directories (`~/.agent-skills`, `~/.claude/skills`, `~/.codex/skills`, `~/.config/opencode/skills`) to pick the cleanest global injection path.
-2. **Cook & Route.** `route` enriches raw prompts with the matching global skill, command, hook, and retrieved project context, filters workers by write-access and key constraints, and records a cryptographic receipt without running anything.
-3. **Lease.** A key is leased strictly within the worker's provider boundary. A NIM request never receives a GROQ or Gemini key. Each key allows 3 concurrent runs and 40 calls per minute; a dispatch waits up to 30 s, then fails.
-4. **Execute & Oversee.** CLI agents run non-interactively with stdin closed (`claude -p`, `codex exec`, `opencode run`, `omp -p`); API workers call the provider chat-completions endpoint. Every live PID is tracked in the menu bar and can be terminated cleanly via `POST /kill/{pid}`.
-5. **Verify & Record.** Gates (`--gate`, `--worktree`) verify changes before apply, and every run records caller, worker, key slot, output, and timing.
+1. **Probe & Readiness (`doctor`, `GET /api/readiness`)**: Checks for `pi`/`pi-rust`, CLI coding agents (`claude`, `codex`, `opencode`, `omp`), Ollama, Keychain/env keys, and external skills. Reports `full`, `mini_harness`, or `bare_minimum`, and supports one-click `pi-rust` installation.
+2. **Cook & Route (`route`)**: Enriches raw prompts with matched skill files + Task Ledger `workflow_loop`, filters candidates by `read_only`, `allow_keys`, and cost tier (`local` / `free_tier` preferred; `metered_paid` gated behind `--approve`), and records a cryptographic receipt without running anything.
+3. **Lease & Proxy (`registry`, `POST /v1/chat/completions`)**: Leases keys inside the provider boundary (`max_inflight_per_key: 3`, `rpm_per_key: 30`, `nim: 40`) with `LeaseGuard` RAII cleanup and automatic sibling failover on truncation/failure.
+4. **Execute & Verify (`run`, `fanout`)**: Runs `pi` / CLI workers non-interactively with strict timeouts (`cli_timeout_s: 180`), optional `git worktree` isolation (`--worktree`), and verification gates (`--gate test|build|gitleaks|git-clean|<cmd>`).
+5. **Overnight Proposals (`overnight`)**: Opt-in scanner proposes repo checks as `pending_approval` tickets with cost-tier caps. Nothing runs unattended without owner approval.
 
 ---
 
 <a id="install"></a>
 
-## Install
+## Install & Build (macOS)
 
-Requires Rust (`cargo`) for the local core engine, plus Node.js 22 if building/previewing the web dashboard (`npm run build:web`).
+Requires Rust (`cargo`), Xcode Command Line Tools (`swift`), and `git`.
 
-### macOS & Linux
+### Quick Bootstrap (Recommended on a Clean Mac)
 
 ```sh
 git clone https://github.com/brusnyak/lingonberry-router.git
-cd lingonberry-router/core
-cargo install --path .                 # puts lingonberry-core on PATH
-lingonberry-core init                   # scans & writes ~/.lingonberry/config.json
-lingonberry-core doctor                 # read-only health check, exit 1 on any failure
+cd lingonberry-router
+./scripts/install_mac.sh --install
+open "/Applications/Lingonberry Router.app"
 ```
 
-### Windows (PowerShell)
+See [`docs/MAC_BOOTSTRAP.md`](docs/MAC_BOOTSTRAP.md) for a clean-slate local wipe (`rm -rf ~/.lingonberry`), a copy-ready Agent Setup Prompt, and a full macOS verification checklist.
 
-```powershell
-git clone https://github.com/brusnyak/lingonberry-router.git
-cd lingonberry-router\core
+### Manual Build
+
+```sh
+cd core
+cargo test
 cargo install --path .
-lingonberry-core init
+lingonberry-core init --yes
+lingonberry-core self-config --apply
 lingonberry-core doctor
 ```
 
-Provider keys go in `~/.env` or `~/.config/lingonberry/env` as `NAME=value`. The router reads the values at dispatch time and never prints or stores them.
-
----
-
-## Quick Check
+Run the native macOS SwiftUI Menu Bar app directly:
 
 ```sh
-lingonberry-core discover                                    # agents, key names, workers, skill dirs
-lingonberry-core route "summarise this README in one line"   # receipt only, nothing runs
-lingonberry-core run --worker pi "say hi"                    # one real run
-lingonberry-core serve                                       # start loopback HTTP API on 127.0.0.1:8799
+cd ui/macos-swift
+swift build -c release
+swift run lingonberry-tray
 ```
+
+*(Note: `src/`, `tray/`, `ui/linux/`, and `ui/windows/` are deferred to future multi-OS phases; `core/` and `ui/macos-swift/` are the active Mac-first target.)*
 
 ---
 
-<a id="global-first-self-configuration"></a>
+<a id="self-configuration--mini-harness"></a>
 
-## Global-First Self-Configuration
+## Self-Configuration & Mini-Harness
 
-Lingonberry avoids duplicating heavy configuration across every agent CLI:
-
-1. **Global layer first**: When a shared global skills or constitution directory exists (`~/.agent-skills`, `~/.claude/skills`, `~/.codex/skills`), `init` writes one canonical `lingonberry-router` skill and constitution directive there.
-2. **Light per-agent pointers**: Individual agent instruction files (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`) receive only a minimal 2-line pointer block so every agent knows the router exists upon startup.
+1. **Embedded Mini-Harness**: If `~/.agent-skills` or external skill packs are sparse, `lingonberry-core` seeds lightweight starter skills under `~/.lingonberry/harness/skills`.
+2. **Global-First Pointers**: `self-config --apply` writes one shared skill/constitution in your global skill root and concise 2-line pointer blocks to detected agent configs (`~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.config/opencode/AGENTS.md`).
+3. **Encrypted Key Onboarding**: Add keys from the menu bar (**Setup → Keys**); they are verified live against `/models`, stored in macOS Keychain (`lingonberry-router`), and referenced only by slot name (`kc:<provider>:<label>`).
 
 ### Config Keys (`~/.lingonberry/config.json`)
 
-An invalid config stops the router with the exact problems; it never runs on a config it cannot trust.
-
 | Key | Default | Meaning |
 |---|---|---|
-| `port` | `8799` | Port for `serve` when no address is given |
-| `default_worker` | `pi` | Worker used when a run names none (must be routable) |
+| `port` | `8799` | Loopback HTTP port |
+| `default_worker` | `pi` | Default execution worker |
 | `max_inflight_per_key` | `3` | Concurrent runs per key slot |
-| `rpm_per_key` | `40` | Calls per key slot per 60 s |
-| `cooldown_s` | `60` | Rest seconds after a failed call on a key slot |
-| `lease_wait_s` | `30` | Seconds a dispatch waits for a free key |
-| `excluded_agents` | `["cline"]` | Discovered but never routed to |
+| `rpm_per_key` | `30` | Calls per key slot per 60 s (`provider_rpm.nim = 40`) |
+| `cooldown_s` | `60` | Cooldown seconds after failure |
+| `lease_wait_s` | `30` | Max seconds waiting for a free key lease |
+| `cli_timeout_s` | `180` | Max runtime before terminating child CLI workers |
+| `paid_keys_require_approval` | `true` | Require `--approve` before leasing `metered_paid` keys |
+| `overnight_enabled` | `false` | Opt-in Overnight proposal queue |
+| `overnight_budget_usd` | `0.0` | `0.0` restricts overnight proposals to free/local keys |
+| `overnight_max_runs_per_night` | `5` | Daily run cap for overnight tickets |
 
-State lives in `~/.lingonberry` (override with `$LINGONBERRY_HOME`). Decisions are appended as JSON lines to `~/.lingonberry/logs/events.jsonl`; key values are never written.
+State lives in `~/.lingonberry` (override with `$LINGONBERRY_HOME`). Loopback bearer token lives in `~/.lingonberry/api.token` (`0600`).
 
 ---
 
@@ -128,79 +113,31 @@ State lives in `~/.lingonberry` (override with `$LINGONBERRY_HOME`). Decisions a
 
 | Command | Use |
 |---|---|
-| `init [--force]` | Create `~/.lingonberry` and `config.json` (idempotent) |
-| `doctor` | Read-only health check, JSON |
-| `discover` | Agents, key names, providers, workers, and library dirs |
-| `route "<prompt>"` | Choose a worker and print the receipt; does not run |
-| `run "<prompt>" [--worker <id>] [--caller <name>] [--gate <cmd>] [--worktree] [--approve]` | Dispatch one task |
-| `fanout "<p1>" "<p2>" …` | One run per prompt, round-robin over workers |
-| `serve [127.0.0.1:8799]` | Loopback HTTP API and run store |
-| `self-config [--apply]` | Print or apply global-first skill, constitution & 2-line light pointers |
-| `mcp` | JSON-RPC 2.0 MCP stdio bridge (`lingonberry_route`, `lingonberry_discover`, `lingonberry_snapshot`, `lingonberry_self_config`) |
-
-`ROUTER_CALLER` overrides caller detection.
+| `init [--force] [--yes]` | Create config, mini-harness, and `api.token` (idempotent) |
+| `doctor` | Read-only health & readiness JSON check (`exit 1` if critical failure) |
+| `discover` | Discovered agents, key slots (redacted), providers, Keychain metadata |
+| `route "<prompt>" [--worktree] [--approve]` | Select worker and record receipt (dry-run) |
+| `run "<prompt>" [--worker <id>] [--caller <name>] [--gate <cmd>] [--worktree] [--read-only] [--approve]` | Execute one verified run |
+| `fanout "<p1>" "<p2>" [--approve]` | Parallel dispatch across available workers |
+| `serve [127.0.0.1:8799]` | Start authenticated loopback daemon |
+| `self-config [--apply]` | Inspect or apply global-first agent pointers |
+| `mcp` | JSON-RPC 2.0 stdio MCP bridge |
 
 ---
 
 <a id="http-api"></a>
 
-## HTTP API (loopback)
+## HTTP API (`127.0.0.1:8799`)
+
+All `POST`/`PUT`/`DELETE` routes and `/v1/chat/completions` require `Authorization: Bearer <token>` from `~/.lingonberry/api.token` and reject untrusted browser `Origin` headers.
 
 | Method | Path | Use |
 |---|---|---|
-| `GET` | `/snapshot` | Running workers, sessions, key slots, cron jobs & live cron PIDs, overview, system metrics |
-| `GET` | `/keys` | Key-slot status (inflight, cooldown countdown, and per-provider RPM limit) |
-| `POST` | `/api/keys/{name}/rpm` | Dynamically adjust per-provider RPM ceiling (`5..300`) by provider or key slot name |
-| `POST` | `/keys/{name}/reset` | Clear cooldown lock on a key slot (`POST /api/keys/{name}/reset` alias) |
-| `GET` | `/runs`, `/runs/{id}` | Run history and one run |
-| `GET` | `/receipts`, `/receipts/{id}` | Routing receipts |
-| `GET` | `/discover` | Discovered agents, key names, providers, workers |
-| `POST` | `/kill/{pid}` | `SIGTERM` the process group of one live router worker; refused for any pid the router did not start |
-| `GET` | `/api/jobs` | All host-discovered (`crontab`, `launchd`, `systemd`, `schtasks`) & router jobs + live cron PIDs |
-| `POST` | `/api/jobs/rescan` | Rescan host OS cron jobs and systemd/launchd/schtasks schedules |
-| `POST` | `/api/jobs/kill/{pid}` | Send `SIGTERM` to an active OS cron child PID |
-| `POST` | `/api/jobs/{name}/heal` | Clear crash lock and reset a crashed cron job back to supervised scheduling |
-| `POST` | `/api/jobs/{name}/watchdog` | Toggle `KeepAlive` auto-restart watchdog for a cron job |
-| `POST` | `/api/jobs/{name}/simulate-crash` | Simulate exit `rc=137` to test KeepAlive auto-restart or manual Heal |
-| `GET` | `/version` | `exe_mtime` of the running binary |
-| `POST` | `/shutdown` | Stop this core |
-
----
-
-## Cross-OS Native UIs & Local Development
-
-The Rust daemon (`core/`) serves loopback `127.0.0.1:8799` for three native desktop UIs alongside the Vite + React preview workbench:
-
-| Target | Stack | Run / Build |
-|---|---|---|
-| **Rust Core** (`core/`) | Rust + `axum` + SQLite WAL + `sysinfo` | `cd core && cargo test && cargo install --path .` |
-| **macOS Menu Bar** (`ui/macos-swift/`) | Native SwiftUI `MenuBarExtra` | `cd ui/macos-swift && swift run LingonberryBar` |
-| **Windows Tray** (`ui/windows/`) | .NET 8 WPF + `NotifyIcon` | `dotnet run --project ui/windows/LingonberryTray.csproj` |
-| **Linux Tray** (`ui/linux/`) | Rust GTK4 + `ksni` StatusNotifierItem | `cd ui/linux && cargo run --release` |
-| **Web Preview / Vercel** (`src/`) | Express + Vite + React + Tailwind v4 | `npm run dev` · `npm run build:web` |
-
----
-
-## Build and Test
-
-```sh
-cd core && cargo test          # Rust core unit & HTTP tests
-cd core && cargo build
-npm run build:web              # Static bundle in dist/ for Vercel
-```
-
-CI (`.github/workflows/ci.yml`) runs the core tests and build on Linux and a gitleaks secret scan on every push and pull request.
-
----
-
-<a id="known-gaps"></a>
-
-## Resolved & Current Scope
-
-- Truncated outputs automatically trigger retry on a sibling key slot (`find_fallback_worker`) and place the failing slot on cooldown.
-- `LeaseGuard` uses RAII (`Drop`) in `core/src/registry.rs` so panics or early returns never leak inflight slots.
-- `doctor` health markers exclude down workers during constraint filtering in `core/src/agents.rs`.
-- `fanout` runs and cron kill/heal actions write structured records to SQLite and `events.jsonl`.
-
-Current state and open decisions: [`HANDOFF.md`](HANDOFF.md) · Next build phase: [`HANDOFF-AI-STUDIO.md`](HANDOFF-AI-STUDIO.md).
-
+| `GET` | `/health`, `/version`, `/snapshot`, `/api/readiness`, `/api/discover`, `/api/keys`, `/api/runs`, `/api/jobs`, `/api/self-config`, `/api/overnight` | Read-only state & diagnostics |
+| `POST` | `/api/route`, `/api/run`, `/api/fanout`, `/api/rescan`, `/shutdown` | Authenticated routing, dispatch, and daemon lifecycle |
+| `POST` | `/api/install/pi` | Consented `pi-rust` install (`cargo` or `brew`) + proxy setup |
+| `POST` / `DELETE` | `/api/keys/add`, `/api/keys/test`, `/api/keys/{slot}`, `/api/keys/{name}/reset`, `/api/keys/{name}/rpm` | Keychain onboarding, live probe, cooldown/RPM control |
+| `POST` | `/api/kill/{pid}`, `/api/jobs/kill/{pid}`, `/api/jobs/{name}/toggle`, `/api/jobs/{name}/run`, `/api/jobs/{name}/heal` | Process/job control (`403` on discovered read-only host jobs or unowned PIDs) |
+| `POST` | `/api/self-config/apply` | Apply selected global/pointer config targets |
+| `POST` | `/api/overnight/toggle`, `/api/overnight/scan`, `/api/overnight/tickets/{id}/approve`, `/api/overnight/tickets/{id}/defer` | Overnight policy & ticket approval flow |
+| `POST` | `/v1/chat/completions` | Authenticated OpenAI-compatible loopback proxy for `pi-rust` |

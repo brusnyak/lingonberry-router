@@ -1,26 +1,35 @@
 import React, { useMemo, useState } from 'react';
 import type { RouterRuntimeState } from '../lib/routerClient';
-import type { SessionRow, SessionStep, WorkerStatus } from '../../types';
+import type { KiroSpecManifest, SessionRow, WorkerStatus } from '../../types';
+import idleMockupImg from '../../assets/images/menubar_idle_preview_1795822249074.jpg';
+import activeMockupImg from '../../assets/images/menubar_active_preview_1795822249329.jpg';
 
-/*
- * Menu bar workbench. Caller → Router → Workers flow.
- * Caller = who initiated the work (left). Worker = who executed it (right).
- * Idle by default: graph shows only the router. Callers, workers and gates appear when work runs.
- */
+export type MenuBarViewMode = 'interactive' | 'mockup-idle' | 'mockup-active';
 
 interface MenuBarGigaProps {
   state: RouterRuntimeState;
   busy: boolean;
+  initialViewMode?: MenuBarViewMode;
   onRefresh: () => Promise<void> | void;
   onKillWorker: (pid: number) => Promise<void> | void;
   onAdjustProviderRpm: (provider: string, nextRpm: number) => Promise<void> | void;
   onToggleJob?: (name: string) => Promise<void> | void;
   onRunJob?: (name: string) => Promise<void> | void;
   onHealJob?: (name: string) => Promise<void> | void;
-  onRoute?: (p: never) => unknown;
-  onRun?: (p: never) => unknown;
-  onFanout?: (p: never) => unknown;
-  onResetKey?: (p: never) => unknown;
+  onRoute?: (p: { prompt: string; caller: string; worktree: boolean }) => Promise<void> | void;
+  onRun?: (p: {
+    prompt: string;
+    caller: string;
+    worktree: boolean;
+    simulate_fault: 'none' | '429' | 'truncated' | 'gate-escalate';
+    live_api: boolean;
+  }) => Promise<void> | void;
+  onFanout?: (p: { prompt: string; caller: string; worktree: boolean }) => Promise<void> | void;
+  onSetIdle?: () => Promise<void> | void;
+  onApproveSpec?: (specId: string) => Promise<void> | void;
+  onRunSpec?: (specId: string) => Promise<void> | void;
+  onToggleChannel?: (id: string) => Promise<void> | void;
+  onResetKey?: (name: string) => Promise<void> | void;
   onOpenCronTab?: () => void;
   onOpenAgentsTab?: () => void;
 }
@@ -30,41 +39,46 @@ const isBlocked = (s: SessionRow) => ['blocked', 'escalated', 'failed'].includes
 
 function clock(ts: number): string {
   const d = new Date(ts * 1000);
-  return Number.isNaN(d.getTime()) ? '--:--' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+  return Number.isNaN(d.getTime())
+    ? '--:--'
+    : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 }
+
 function ago(ts: number): string {
   const s = Math.max(0, Date.now() / 1000 - ts);
   if (s < 60) return `${Math.round(s)}s ago`;
   if (s < 3600) return `${Math.round(s / 60)}m ago`;
   return `${Math.round(s / 3600)}h ago`;
 }
+
 function dur(sec: number): string {
   if (sec < 60) return `${sec.toFixed(0)}s`;
   return `${Math.floor(sec / 60)}m ${Math.round(sec % 60)}s`;
 }
 
-async function copyText(text: string) {
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch {
-    /* clipboard may be unavailable in a webview; the text stays selectable */
-  }
-}
-
 export const MenuBarGiga: React.FC<MenuBarGigaProps> = ({
   state,
   busy,
+  initialViewMode = 'interactive',
   onRefresh,
   onKillWorker,
   onAdjustProviderRpm,
-  onToggleJob,
-  onRunJob,
-  onHealJob,
+  onRun,
+  onFanout,
+  onSetIdle,
+  onApproveSpec,
+  onRunSpec,
+  onToggleChannel,
 }) => {
   const snap = state.snapshot;
+  const [viewMode, setViewMode] = useState<MenuBarViewMode>(initialViewMode);
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [setupTab, setSetupTab] = useState<'keys' | 'channels' | 'specs'>('keys');
   const [filter, setFilter] = useState<'all' | 'active' | 'blocked' | 'done'>('all');
   const [openId, setOpenId] = useState<string | null>(null);
-  const [showAll, setShowAll] = useState(false);
+  const [idleImgFailed, setIdleImgFailed] = useState(false);
+  const [activeImgFailed, setActiveImgFailed] = useState(false);
+  const [menubarSvgFailed, setMenubarSvgFailed] = useState(false);
 
   const running = useMemo(() => snap.sessions.filter(isRunning), [snap.sessions]);
   const blocked = useMemo(() => snap.sessions.filter(isBlocked), [snap.sessions]);
@@ -75,11 +89,16 @@ export const MenuBarGiga: React.FC<MenuBarGigaProps> = ({
 
   const visibleSessions = useMemo(() => {
     const list =
-      filter === 'active' ? running : filter === 'blocked' ? blocked : filter === 'done' ? done : snap.sessions;
-    return showAll ? list : list.slice(0, 8);
-  }, [filter, snap.sessions, running, blocked, done, showAll]);
+      filter === 'active'
+        ? running
+        : filter === 'blocked'
+          ? blocked
+          : filter === 'done'
+            ? done
+            : snap.sessions;
+    return list.slice(0, 5);
+  }, [filter, snap.sessions, running, blocked, done]);
 
-  // Callers of work that is running now: who initiated (left side of graph).
   const activeCallers = useMemo(() => {
     const seen = new Map<string, number>();
     for (const s of running) {
@@ -89,7 +108,6 @@ export const MenuBarGiga: React.FC<MenuBarGigaProps> = ({
     return Array.from(seen.entries());
   }, [running]);
 
-  // Providers, every key listed.
   const providers = useMemo(() => {
     const map = new Map<string, WorkerStatus[]>();
     for (const w of snap.workers) {
@@ -102,345 +120,661 @@ export const MenuBarGiga: React.FC<MenuBarGigaProps> = ({
       rpm: workers[0]?.rpm_limit ?? 0,
       calls: workers.reduce((n, w) => n + w.calls_24h, 0),
       inflight: workers.reduce((n, w) => n + (w.inflight ?? 0), 0),
-      active: workers.some((w) => w.status === 'active'),
     }));
   }, [snap.workers]);
 
-  const activeKeys = new Set(snap.workers_live.map((w) => w.key).filter(Boolean));
-  const activeProviders = providers.filter((p) => p.workers.some((w) => activeKeys.has(w.key ?? '')));
-
-  let gatePass = 0;
-  let gateFail = 0;
-  for (const s of running) {
-    const g = (s.steps ?? []).find((st: SessionStep) => st.stage === 'gate');
-    if (!g) continue;
-    if (g.tone === 'warn') gateFail += 1;
-    else gatePass += 1;
-  }
-
-  const routerJobs = snap.jobs.filter((j) => j.source === 'lingonberry');
-
-  const surfaceCls = document.documentElement.classList.contains('dark') ? 'lb-surface-alt' : 'lb-surface';
-  const panelCls = document.documentElement.classList.contains('dark') ? 'lb-panel' : 'lb-surface-alt';
-  const borderCls = document.documentElement.classList.contains('dark') ? 'border-white/[0.08]' : 'lb-border';
-  const textCls = document.documentElement.classList.contains('dark') ? 'text-slate-200' : 'text-zinc-900';
-  const mutedCls = document.documentElement.classList.contains('dark') ? 'text-slate-400' : 'text-zinc-500';
+  const watchdog = snap.watchdog;
+  const sandbox = snap.sandbox;
+  const swarm = snap.swarm;
+  const gateway = snap.gateway;
+  const specs: KiroSpecManifest[] = snap.specs ?? [];
 
   return (
-    <section
-      className={`w-[900px] max-w-full rounded-2xl ${surfaceCls} ${textCls} border ${borderCls} shadow-popover overflow-hidden flex flex-col`}
-    >
+    <section className="w-full rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#111114] text-zinc-950 dark:text-zinc-100 overflow-hidden">
       <style>{`
         @keyframes lb-flow { to { stroke-dashoffset: -20; } }
         .lb-flow { stroke-dasharray: 5 5; animation: lb-flow 1.1s linear infinite; }
       `}</style>
 
-      {/* header */}
-      <header className="px-4 py-3 border-b flex items-center justify-between select-none">
-        <div className="flex items-center space-x-3">
-          <div className="w-6 h-6 rounded-lg bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-600 dark:text-[#fabb60]">
-            <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} viewBox="0 0 24 24">
-              <circle cx="12" cy="12" r="2.5"></circle>
-              <path d="M12 2v3m0 14v3M2 12h3m14 0h3m-3.8-6.8l-2.1 2.1m-6.4 6.4l-2.1 2.1m0-10.6l2.1 2.1m6.4 6.4l2.1 2.1"></path>
-            </svg>
+      {/* Simulator Toolbar */}
+      <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#18181B]/60 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-1 p-1 rounded-lg bg-zinc-200/70 dark:bg-[#09090B] border border-zinc-200 dark:border-zinc-800">
+          {(
+            [
+              { id: 'interactive', label: 'Interactive Popover' },
+              { id: 'mockup-idle', label: 'Mockup: Idle' },
+              { id: 'mockup-active', label: 'Mockup: Active' },
+            ] as const
+          ).map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              onClick={() => setViewMode(item.id)}
+              className={`px-3 py-1 rounded-md text-[11px] font-mono font-medium transition-colors whitespace-nowrap shrink-0 ${
+                viewMode === item.id
+                  ? 'bg-white dark:bg-zinc-800 text-zinc-950 dark:text-white shadow-2xs'
+                  : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-950 dark:hover:text-white'
+              }`}
+            >
+              {item.label}
+            </button>
+          ))}
+        </div>
+
+        {viewMode === 'interactive' && (
+          <div className="flex flex-wrap items-center gap-2 text-[11px] font-mono">
+            {onSetIdle && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => void onSetIdle()}
+                className="px-3 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0"
+              >
+                Idle State
+              </button>
+            )}
+            {onFanout && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() =>
+                  void onFanout({
+                    prompt: 'Verify Seatbelt SBPL worktree boundaries and API token guard',
+                    caller: 'tg:owner',
+                    worktree: true,
+                  })
+                }
+                className="px-3 py-1.5 rounded-md bg-zinc-950 hover:bg-zinc-800 dark:bg-zinc-100 dark:hover:bg-white text-white dark:text-zinc-950 font-semibold whitespace-nowrap shrink-0 transition-colors"
+              >
+                Active Swarm
+              </button>
+            )}
+            {onRun && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() =>
+                  void onRun({
+                    prompt: 'Refactor auth token rotation & run cargo test',
+                    caller: 'mcp:claude',
+                    worktree: true,
+                    simulate_fault: 'gate-escalate',
+                    live_api: false,
+                  })
+                }
+                className="px-3 py-1.5 rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0"
+              >
+                Test Escalation
+              </button>
+            )}
           </div>
-          <h1 className="text-[13px] font-semibold tracking-tight font-mono">Lingonberry Router</h1>
-        </div>
-        <div className="flex items-center space-x-2.5">
-          <span className="hidden sm:inline text-[10px] font-mono {mutedCls}">127.0.0.1:8799</span>
-          <span className={`text-[10px] font-mono px-2 py-0.5 rounded border ${
-            hasActive ? 'text-amber-300 border-amber-400/30 bg-amber-400/10' : `${mutedCls} border-white/[0.08] bg-white/[0.03]`
-          }`}>
-            {hasActive ? `${running.length} running` : 'idle'}
-          </span>
-          <button
-            type="button"
-            onClick={() => onRefresh()}
-            disabled={busy}
-            title="Refresh state"
-            aria-label="Refresh state"
-            className="w-7 h-7 flex items-center justify-center rounded text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.06] transition"
-          >
-            <svg className={`w-3.5 h-3.5 ${busy ? 'animate-spin' : ''}`} fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} viewBox="0 0 24 24">
-              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"></path>
-            </svg>
-          </button>
-        </div>
-      </header>
+        )}
+      </div>
 
-      <div className="p-3.5 space-y-3 overflow-y-auto max-h-[88vh]">
-        {/* summary: plain text, no big bars */}
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 px-1 font-mono text-[11px] {mutedCls}">
-          <span>running <span className={hasActive ? 'text-amber-300' : 'text-zinc-200'}>{running.length}</span></span>
-          <span>avg <span className={textCls}>{snap.overview.avg_duration_s == null ? '—' : dur(snap.overview.avg_duration_s)}</span></span>
-          <span>success <span className={textCls}>{successPct == null ? '—' : `${successPct.toFixed(0)}%`}</span></span>
-          <span className="ml-auto text-zinc-500">{snap.sessions.length} tasks · 24h</span>
-        </div>
-
-        {/* graph: caller → router → worker */}
-        <section className={`bg-zinc-900/20 dark:bg-white/[0.02] border rounded-xl p-3 ${borderCls}`}>
-          {!hasActive ? (
-            <div className="flex flex-col items-center justify-center py-4 gap-2">
-              <div className="px-4 py-2 rounded-xl border bg-zinc-900/30 dark:bg-white/[0.03] text-[11px] font-mono text-zinc-400 dark:text-zinc-500">
-                Router
-              </div>
-              <span className="text-[10px] font-mono {mutedCls}">idle · nothing running</span>
-            </div>
+      {/* Mode 2 & 3: Generated Native macOS Mockups */}
+      {viewMode === 'mockup-idle' && (
+        <div className="p-6 sm:p-8 bg-zinc-50 dark:bg-[#09090B] space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-zinc-500 dark:text-zinc-400">
+            <span>macOS SwiftUI MenuBarExtra · Idle</span>
+            <span>Collapsed graph · Hidden worker cards</span>
+          </div>
+          {!idleImgFailed ? (
+            <img
+              src={idleMockupImg}
+              alt="macOS SwiftUI Lingonberry Menu Bar Idle State Preview"
+              referrerPolicy="no-referrer"
+              onError={() => setIdleImgFailed(true)}
+              className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800 object-cover max-h-[520px]"
+            />
           ) : (
-            <div className="grid grid-cols-[1fr_44px_auto_44px_1fr] items-center gap-0">
-              <div className="space-y-2">
-                {activeCallers.map(([c, n]) => (
-                  <div key={c} className="px-3 py-2 rounded-lg border border-sky-400/30 bg-sky-400/[0.06] flex items-center justify-between text-[11px] font-mono">
-                    <span className="text-sky-200 truncate">{c}</span>
-                    <span className="text-sky-300/70">{n}</span>
-                  </div>
-                ))}
-              </div>
-              <svg width="44" height="12" viewBox="0 0 44 12" className="justify-self-center self-center" aria-hidden="true">
-                <path d="M0 6 H44" stroke="currentColor" strokeOpacity={0.5} strokeWidth={1} fill="none" className="lb-flow" />
-              </svg>
-              <div className="px-4 py-3 rounded-lg border border-amber-400/40 bg-amber-400/[0.06] text-center">
-                <div className="text-[11px] font-mono font-semibold text-amber-200">Router</div>
-                <div className="text-[10px] font-mono text-amber-300/70 mt-0.5">{running.length} dispatching</div>
-              </div>
-              <svg width="44" height="12" viewBox="0 0 44 12" className="justify-self-center self-center" aria-hidden="true">
-                <path d="M0 6 H44" stroke="currentColor" strokeOpacity={0.5} strokeWidth={1} fill="none" className="lb-flow" />
-              </svg>
-              <div className="space-y-2">
-                {snap.workers_live.map((w) => (
-                  <div key={w.pid} className="px-3 py-2 rounded-lg border border-amber-400/30 bg-amber-400/[0.06] flex items-center justify-between text-[11px] font-mono">
-                    <span className="text-amber-200 truncate">{w.worker}</span>
-                    <span className="text-amber-300/70 truncate ml-2">{w.key ?? ''}</span>
-                  </div>
-                ))}
-                {activeProviders.length === 0 && snap.workers_live.length === 0 && <div className="text-[10px] font-mono {mutedCls}">no worker yet</div>}
-                <div className="pt-1 space-y-1">
-                  {gateFail + gatePass > 0 && (
-                    <div className="flex items-center justify-between text-[10px] font-mono {mutedCls}">
-                      <span>gates</span>
-                      <span><span className="text-emerald-400">{gatePass} pass</span> · <span className={gateFail ? 'text-rose-400' : 'text-zinc-600'}>{gateFail} fail</span></span>
-                    </div>
-                  )}
-                </div>
-              </div>
+            <div className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-900 p-8 text-center font-mono text-xs text-zinc-300">
+              macOS Idle Popover — Router idle · Watchdog Normal
             </div>
           )}
-        </section>
-
-        {/* workers, providers, router jobs — tight grid, no gaps */}
-        <div className="grid grid-cols-12 gap-2">
-          <section className="col-span-12 md:col-span-4 ${panelCls} border rounded-xl p-2.5 ${borderCls}">
-            <div className="flex items-center justify-between pb-1 border-b mb-1.5 text-[10px]">
-              <span className="font-medium text-zinc-200 dark:text-white">Workers</span>
-              <span className="text-[9px] font-mono {mutedCls}">{snap.workers_live.length} running · {snap.workers.length} keys</span>
-            </div>
-            <div className="space-y-1 font-mono">
-              {snap.workers_live.map((w) => (
-                <div key={w.pid} className="p-1.5 rounded-lg bg-zinc-900/30 dark:bg-white/[0.02] border border-amber-400/20 space-y-0.5">
-                  <div className="flex items-center justify-between text-[10px]">
-                    <span className="font-medium text-amber-200">{w.worker}</span>
-                    <button type="button" onClick={() => onKillWorker(w.pid)} className="px-1 py-0.5 rounded text-[8.5px] text-zinc-400 hover:text-rose-300 bg-white/[0.04] border border-white/[0.06]">stop</button>
-                  </div>
-                  <p className="text-[9.5px] text-zinc-400 truncate">{w.task}</p>
-                </div>
-              ))}
-              {snap.workers.map((w) => (
-                <div key={w.name} className="px-1.5 py-1 rounded-lg ${panelCls} flex items-center justify-between text-[9.5px] ${borderCls}">
-                  <span className="text-zinc-300 dark:text-zinc-200 truncate" title={w.name}>{w.key ?? w.name}</span>
-                  <span className={`text-[8.5px] shrink-0 ml-2 ${w.status === 'down' ? 'text-rose-400' : 'text-zinc-500'}`}>
-                    {w.status === 'down' ? `cooling ${Math.round(w.cooling_remaining_s ?? 0)}s` : `${w.ok_24h} ok`}
-                  </span>
-                </div>
-              ))}
-              {snap.workers.length === 0 && <div className="text-[9px] text-zinc-500">none discovered</div>}
-            </div>
-          </section>
-
-          <section className="col-span-12 md:col-span-4 ${panelCls} border rounded-xl p-2.5 ${borderCls}">
-            <div className="flex items-center justify-between pb-1 border-b mb-1.5 text-[10px]">
-              <span className="font-medium text-zinc-200 dark:text-white">Providers</span>
-              <span className="text-[9px] font-mono {mutedCls}">{providers.length} · calls/min</span>
-            </div>
-            <div className="space-y-1.5 font-mono">
-              {providers.map((p) => {
-                const pct = p.rpm ? Math.min(100, Math.round((p.inflight / p.rpm) * 100)) : 0;
-                return (
-                  <div key={p.provider} className="p-1.5 rounded-lg bg-zinc-900/30 dark:bg-white/[0.02] space-y-1">
-                    <div className="flex items-center justify-between text-[10px]">
-                      <span className="text-zinc-200 dark:text-white">{p.provider}</span>
-                      <div className="flex items-center gap-1.5 text-[9px] text-zinc-300">
-                        <button type="button" aria-label={`lower ${p.provider} limit`} onClick={() => onAdjustProviderRpm(p.provider, Math.max(5, p.rpm - 5))} className="w-3.5 h-3.5 rounded border border-white/[0.08] hover:bg-white/[0.06]">−</button>
-                        <span className="w-12 text-center">{p.rpm}/min</span>
-                        <button type="button" aria-label={`raise ${p.provider} limit`} onClick={() => onAdjustProviderRpm(p.provider, Math.min(300, p.rpm + 5))} className="w-3.5 h-3.5 rounded border border-white/[0.08] hover:bg-white/[0.06]">+</button>
-                      </div>
-                    </div>
-                    <div className="h-px w-full bg-white/[0.06]">
-                      <div className="h-px bg-amber-500/70" style={{ width: `${pct}%` }}></div>
-                    </div>
-                    <div className="text-[9px] text-zinc-500">{p.workers.length} key{p.workers.length === 1 ? '' : 's'} · {p.calls} calls 24h</div>
-                  </div>
-                );
-              })}
-              {providers.length === 0 && <div className="text-[9px] text-zinc-500">none</div>}
-            </div>
-          </section>
-
-          <section className="col-span-12 md:col-span-4 ${panelCls} border rounded-xl p-2.5 ${borderCls}">
-            <div className="flex items-center justify-between pb-1 border-b mb-1.5 text-[10px]">
-              <span className="font-medium text-zinc-200 dark:text-white">Router jobs</span>
-              <span className="text-[9px] font-mono {mutedCls}">{routerJobs.length}</span>
-            </div>
-            <div className="space-y-1.5 font-mono">
-              {routerJobs.length === 0 && <div className="text-[9px] text-zinc-500">none configured</div>}
-              {routerJobs.map((j) => (
-                <div key={j.name} className="p-1.5 rounded-lg bg-zinc-900/30 dark:bg-white/[0.02] flex items-center justify-between gap-1">
-                  <div className="min-w-0">
-                    <div className="text-[10px] text-zinc-200 dark:text-white truncate">{j.name}</div>
-                    <div className="text-[8.5px] text-zinc-500">{j.schedule} · {j.last ? ago(j.last) : 'never ran'}</div>
-                  </div>
-                  <div className="flex gap-0.5 shrink-0">
-                    {onToggleJob && <button type="button" onClick={() => onToggleJob(j.name)} className="px-1 py-0.5 rounded text-[8.5px] text-zinc-400 bg-white/[0.04] border border-white/[0.06]">{j.paused ? 'resume' : 'pause'}</button>}
-                    {onRunJob && <button type="button" onClick={() => onRunJob(j.name)} className="px-1 py-0.5 rounded text-[8.5px] text-zinc-400 bg-white/[0.04] border border-white/[0.06]">run</button>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </section>
         </div>
+      )}
 
-        {/* sessions: conversation-style list, caller-first */}
-        <section className={`bg-zinc-900/20 dark:bg-white/[0.02] border rounded-xl p-2.5 space-y-2 font-mono ${borderCls}`}>
-          <div className="flex flex-wrap items-center justify-between gap-2 text-[10px]">
-            <span className="font-medium text-zinc-200 dark:text-white font-sans">Sessions</span>
-            <div className="flex items-center gap-0.5 bg-zinc-900/30 dark:bg-white/[0.03] p-0.5 rounded-lg border ${borderCls} text-[9px]">
-              {([
-                ['all', `all ${snap.sessions.length}`],
-                ['active', `running ${running.length}`],
-                ['blocked', `blocked ${blocked.length}`],
-                ['done', `done ${done.length}`],
-              ] as const).map(([key, label]) => (
-                <button key={key} type="button" onClick={() => setFilter(key)} className={`px-1.5 py-0.5 rounded ${filter === key ? 'bg-white/[0.1] text-white dark:text-black' : mutedCls} hover:text-zinc-100 dark:hover:text-white`}>
-                  {label}
-                </button>
-              ))}
+      {viewMode === 'mockup-active' && (
+        <div className="p-6 sm:p-8 bg-zinc-50 dark:bg-[#09090B] space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-mono text-zinc-500 dark:text-zinc-400">
+            <span>macOS SwiftUI MenuBarExtra · Active Swarm</span>
+            <span>Caller → Router → Worker curves · Kill PID</span>
+          </div>
+          {!activeImgFailed ? (
+            <img
+              src={activeMockupImg}
+              alt="macOS SwiftUI Lingonberry Menu Bar Active Swarm State Preview"
+              referrerPolicy="no-referrer"
+              onError={() => setActiveImgFailed(true)}
+              className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800 object-cover max-h-[520px]"
+            />
+          ) : (
+            <div className="w-full rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-900 p-8 text-center font-mono text-xs text-zinc-300">
+              macOS Active Swarm — Live orchestration curves + PID controls
             </div>
+          )}
+        </div>
+      )}
+
+      {/* Mode 1: Interactive SwiftUI-Faithful Popover Simulator */}
+      {viewMode === 'interactive' && (
+        <div className="p-6 sm:p-10 bg-zinc-50 dark:bg-[#09090B] flex flex-col items-center gap-3">
+          {/* Realistic macOS Top Menu Bar Strip showing monochrome template Lingonberry icon */}
+          <div className="w-full max-w-[540px] px-4 h-7 rounded-lg bg-zinc-200/80 dark:bg-[#18181B] border border-zinc-300/70 dark:border-zinc-800 flex items-center justify-end gap-4 text-[11px] font-mono text-zinc-700 dark:text-zinc-200">
+            <span className="mr-auto text-[10.5px] text-zinc-500 dark:text-zinc-400">
+              macOS Menu Bar Preview
+            </span>
+            <span className="inline-flex items-center justify-center px-2 py-0.5 rounded bg-white/80 dark:bg-zinc-800 shadow-2xs">
+              {!menubarSvgFailed ? (
+                <img
+                  src="/assets/lingonberry-menubar.svg"
+                  alt="Lingonberry template menu bar icon"
+                  referrerPolicy="no-referrer"
+                  onError={() => setMenubarSvgFailed(true)}
+                  className="w-4 h-4 dark:invert"
+                />
+              ) : (
+                <span className="text-[10px] font-semibold">LB</span>
+              )}
+            </span>
+            <span className="tabular-nums text-zinc-600 dark:text-zinc-300">Tue 09:41</span>
           </div>
 
-          {visibleSessions.length === 0 && <div className="text-[10px] text-zinc-500">no sessions in this view</div>}
+          <div className="w-full max-w-[540px] rounded-xl border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-[#111114] shadow-2xl overflow-hidden">
+            {/* Popover Header */}
+            <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="text-[13px] font-semibold tracking-tight text-zinc-950 dark:text-white whitespace-nowrap shrink-0">
+                  Lingonberry
+                </span>
+                <span className="text-[11px] font-mono text-emerald-600 dark:text-emerald-400 whitespace-nowrap shrink-0">
+                  127.0.0.1:8799
+                </span>
+              </div>
 
-          <ul className="space-y-1.5">
-            {visibleSessions.map((s) => {
-              const open = openId === s.id;
-              const c = s.cooked;
-              const attempts = (s.steps ?? []).filter((st) => st.stage === 'dispatched' || st.stage === 'failover').length;
-              const runCls = `rounded-lg bg-zinc-900/30 dark:bg-white/[0.02] border ${isRunning(s) ? 'border-amber-400/30' : borderCls}`;
-              return (
-                <li key={s.id} className={runCls}>
-                  <button type="button" aria-expanded={open} onClick={() => setOpenId(open ? null : s.id)} className="w-full text-left p-2.5 flex items-start gap-2.5">
-                    <div className="min-w-0 flex-1 space-y-1">
-                      <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9.5px]">
-                        <span className="text-zinc-500">{clock(s.ts)}</span>
-                        <span className={`text-[9.5px] font-semibold ${isRunning(s) ? 'text-amber-400' : 'text-zinc-200 dark:text-white'}`}>{s.caller ?? 'shell'}</span>
-                        <span className="text-zinc-500">→</span>
-                        <span className={`text-[9.5px] font-semibold text-emerald-400`}>{s.worker}</span>
-                        {s.key && <span className="text-zinc-600">{s.key}</span>}
-                      </div>
-                      <p className="text-[11px] {textCls} font-sans leading-snug line-clamp-1">{s.prompt}</p>
-                      {c && (
-                        <div className="flex gap-x-2 gap-y-0.5 text-[9px] {mutedCls}">
-                          <span>skill: {c.selected_skill}</span>
-                          <span>·</span>
-                          <span>gate: {c.gate_policy}</span>
-                          {c.task_class && <span>· {c.task_class}</span>}
+              <div className="flex items-center gap-2.5 text-[11px] font-mono shrink-0">
+                <span
+                  className={
+                    hasActive
+                      ? 'text-indigo-600 dark:text-indigo-400 font-semibold'
+                      : 'text-zinc-400 dark:text-zinc-500'
+                  }
+                >
+                  {hasActive ? `${running.length} running` : 'idle'}
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setSetupOpen((v) => !v)}
+                  className={`px-2.5 py-1 rounded-md border text-[11px] transition-colors whitespace-nowrap shrink-0 ${
+                    setupOpen
+                      ? 'border-indigo-500/40 bg-indigo-500/10 text-indigo-600 dark:text-indigo-400'
+                      : 'border-zinc-200 dark:border-zinc-700 text-zinc-700 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800'
+                  }`}
+                >
+                  {setupOpen ? 'Done' : 'Setup'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void onRefresh()}
+                  disabled={busy}
+                  className="px-2.5 py-1 rounded-md border border-zinc-200 dark:border-zinc-700 text-zinc-600 dark:text-zinc-300 hover:bg-zinc-100 dark:hover:bg-zinc-800 whitespace-nowrap shrink-0"
+                >
+                  {busy ? 'Sync…' : 'Sync'}
+                </button>
+              </div>
+            </div>
+
+            {/* Stat Strip */}
+            <div className="px-5 py-3 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#18181B]/45 grid grid-cols-5 gap-3 font-mono tabular-nums text-[10.5px]">
+              <div>
+                <div className="text-zinc-400 dark:text-zinc-500">Workers</div>
+                <div className="font-semibold text-zinc-950 dark:text-white mt-0.5">
+                  {running.length}/{watchdog?.max_concurrent_workers ?? 8}
+                </div>
+              </div>
+              <div>
+                <div className="text-zinc-400 dark:text-zinc-500">RAM · Disk</div>
+                <div
+                  className={`font-semibold mt-0.5 ${
+                    watchdog?.memory_pressure === 'critical'
+                      ? 'text-red-600 dark:text-red-400'
+                      : watchdog?.memory_pressure === 'warn'
+                        ? 'text-amber-600 dark:text-amber-400'
+                        : 'text-zinc-950 dark:text-white'
+                  }`}
+                >
+                  {watchdog
+                    ? `${watchdog.ram_used_pct.toFixed(0)}% · ${watchdog.free_disk_gb.toFixed(0)}G`
+                    : '54% · 325G'}
+                </div>
+              </div>
+              <div>
+                <div className="text-zinc-400 dark:text-zinc-500">Sandbox</div>
+                <div className="font-semibold text-emerald-600 dark:text-emerald-400 mt-0.5 truncate">
+                  {sandbox?.default_local_tier ?? 'seatbelt'}
+                </div>
+              </div>
+              <div>
+                <div className="text-zinc-400 dark:text-zinc-500">5h Burst</div>
+                <div className="font-semibold text-zinc-950 dark:text-white mt-0.5">
+                  {watchdog
+                    ? `${watchdog.subscription_burst_used}/${watchdog.subscription_burst_cap}`
+                    : '2/45'}
+                </div>
+              </div>
+              <div>
+                <div className="text-zinc-400 dark:text-zinc-500">Success</div>
+                <div className="font-semibold text-zinc-950 dark:text-white mt-0.5">
+                  {successPct == null ? '—' : `${successPct.toFixed(0)}%`}
+                </div>
+              </div>
+            </div>
+
+            {watchdog?.paused_reason && (
+              <div className="px-5 py-2.5 border-b border-red-200 dark:border-red-900/60 bg-red-50 dark:bg-red-950/40 text-[11px] font-mono text-red-700 dark:text-red-300">
+                Watchdog Alert: {watchdog.paused_reason}
+              </div>
+            )}
+
+            {/* Collapsible Setup Drawer */}
+            {setupOpen && (
+              <div className="p-5 border-b border-zinc-200 dark:border-zinc-800 bg-zinc-50/60 dark:bg-[#09090B]/60 space-y-3.5">
+                <div className="flex items-center gap-1 p-1 rounded-lg bg-zinc-200/70 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800">
+                  {(
+                    [
+                      { id: 'keys', label: 'Keys & RPM' },
+                      { id: 'channels', label: 'Channels & pi' },
+                      { id: 'specs', label: `Kiro Specs (${specs.length})` },
+                    ] as const
+                  ).map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      onClick={() => setSetupTab(t.id)}
+                      className={`flex-1 py-1 rounded-md text-[11px] font-mono transition-colors whitespace-nowrap shrink-0 ${
+                        setupTab === t.id
+                          ? 'bg-white dark:bg-zinc-800 text-zinc-950 dark:text-white font-semibold'
+                          : 'text-zinc-500 dark:text-zinc-400'
+                      }`}
+                    >
+                      {t.label}
+                    </button>
+                  ))}
+                </div>
+
+                {setupTab === 'keys' && (
+                  <div className="space-y-2 font-mono text-[11px]">
+                    {providers.map((p) => (
+                      <div
+                        key={p.provider}
+                        className="flex items-center justify-between py-1.5 border-b border-zinc-200/70 dark:border-zinc-800/70 last:border-0"
+                      >
+                        <div>
+                          <span className="font-semibold text-zinc-950 dark:text-white">
+                            {p.provider}
+                          </span>
+                          <span className="text-zinc-500 dark:text-zinc-400 ml-2">
+                            {p.workers.length} slot{p.workers.length === 1 ? '' : 's'} · {p.calls}{' '}
+                            calls
+                          </span>
                         </div>
-                      )}
-                    </div>
-                    <div className="flex flex-col items-end gap-0.5 shrink-0">
-                      <span className={`px-1.5 py-0.5 rounded border text-[8.5px] font-mono ${isRunning(s) ? 'text-amber-200 border-amber-400/40' : s.state === 'done' ? 'text-emerald-300 border-emerald-400/25' : ['blocked','escalated','failed'].includes(s.state) ? 'text-rose-300 border-rose-400/30' : 'text-zinc-300 border-white/[0.08]'}`}>{s.state}</span>
-                      <span className="text-[9px] text-zinc-500">{s.duration_s.toFixed(1)}s · {ago(s.ts)}</span>
-                      {attempts > 1 && <span className="text-[9px] text-zinc-400">{attempts} attempts</span>}
-                    </div>
-                  </button>
-
-                  {open && (
-                    <div className="px-2.5 pb-2.5 space-y-2.5 border-t pt-2.5">
-                      {/* input */}
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-1 text-[9px] uppercase tracking-wider text-zinc-500">You (input)</div>
-                        <p className="whitespace-pre-wrap break-words text-[11px] {textCls} leading-relaxed">{s.prompt}</p>
+                        <div className="flex items-center gap-1.5 tabular-nums">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void onAdjustProviderRpm(p.provider, Math.max(5, p.rpm - 5))
+                            }
+                            className="w-6 h-6 rounded border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                          >
+                            −
+                          </button>
+                          <span className="w-14 text-center">{p.rpm}/min</span>
+                          <button
+                            type="button"
+                            onClick={() =>
+                              void onAdjustProviderRpm(p.provider, Math.min(300, p.rpm + 5))
+                            }
+                            className="w-6 h-6 rounded border border-zinc-200 dark:border-zinc-700 hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                          >
+                            +
+                          </button>
+                        </div>
                       </div>
+                    ))}
+                  </div>
+                )}
 
-                      {/* router decision */}
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-1 text-[9px] uppercase tracking-wider text-zinc-500">Router (what it did)</div>
-                        {c ? (
-                          <dl className="grid grid-cols-[64px_1fr] gap-x-2 gap-y-0.5 text-[10px]">
-                            <dt className="text-zinc-500">skill</dt><dd className="text-zinc-200 break-all">{c.selected_skill}</dd>
-                            <dt className="text-zinc-500">command</dt><dd className="text-zinc-200 break-all">{c.selected_command}</dd>
-                            <dt className="text-zinc-500">hook</dt><dd className="text-zinc-200">{c.selected_hook}</dd>
-                            <dt className="text-zinc-500">gate</dt><dd className="text-zinc-200">{c.gate_policy}</dd>
-                            <dt className="text-zinc-500">task class</dt><dd className="text-zinc-200">{c.task_class}</dd>
-                            <dt className="text-zinc-500">context</dt><dd className="text-zinc-400 break-all">{c.retrieval_sources.join(' · ') || '—'}</dd>
-                          </dl>
-                        ) : (
-                          <span className="text-[10px] text-zinc-500">not recorded for this run</span>
-                        )}
+                {setupTab === 'channels' && (
+                  <div className="space-y-2 font-mono text-[11px]">
+                    <div className="text-zinc-500 dark:text-zinc-400">
+                      pi-rust ready · {gateway?.entries_count ?? 0} MEMORY.md entries
+                    </div>
+                    {(gateway?.channels ?? []).map((ch) => (
+                      <div
+                        key={ch.id}
+                        className="flex items-center justify-between py-1.5 border-b border-zinc-200/70 dark:border-zinc-800/70 last:border-0"
+                      >
+                        <div className="min-w-0 pr-2">
+                          <div className="font-semibold text-zinc-950 dark:text-white">
+                            {ch.label}
+                          </div>
+                          <div className="text-[10px] text-zinc-500 dark:text-zinc-400 truncate">
+                            {ch.transport}
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => onToggleChannel && void onToggleChannel(ch.id)}
+                          className={`px-2.5 py-1 rounded border text-[10px] whitespace-nowrap shrink-0 ${
+                            ch.enabled
+                              ? 'border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400'
+                              : 'border-zinc-200 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400'
+                          }`}
+                        >
+                          {ch.enabled ? 'Connected' : 'Enable'}
+                        </button>
                       </div>
+                    ))}
+                  </div>
+                )}
 
-                      {/* worker answer */}
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-1 text-[9px] uppercase tracking-wider {${
-                          s.state === 'done' ? 'text-emerald-400' : isBlocked(s) ? 'text-rose-400' : 'text-zinc-500'
-                        }}">{s.worker} (answer)</div>
-                        <div className="relative">
-                          <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-words rounded-md bg-zinc-950/60 dark:bg-white/[0.02] border border-white/[0.04] p-2 text-[10px] leading-relaxed text-zinc-200">
-                            {s.output ?? s.reason ?? (isRunning(s) ? 'working…' : '—')}
-                          </pre>
-                          {s.output && (
-                            <button type="button" onClick={() => copyText(s.output ?? '')} className="absolute top-1 right-1 px-1.5 py-0.5 rounded text-[8.5px] text-zinc-400 bg-white/[0.05] border border-white/[0.08] hover:text-zinc-100">copy</button>
+                {setupTab === 'specs' && (
+                  <div className="space-y-2 font-mono text-[11px]">
+                    {specs.map((spec) => (
+                      <div
+                        key={spec.spec_id}
+                        className="flex items-center justify-between gap-2 py-1.5 border-b border-zinc-200/70 dark:border-zinc-800/70 last:border-0"
+                      >
+                        <div className="min-w-0">
+                          <div className="font-semibold text-zinc-950 dark:text-white truncate">
+                            {spec.title}
+                          </div>
+                          <div className="text-[10px] text-zinc-500 dark:text-zinc-400">
+                            {spec.status} · {spec.sandbox_tier} · sha256:
+                            {spec.sha256_digest.slice(0, 8)}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          {spec.status === 'draft' && onApproveSpec && (
+                            <button
+                              type="button"
+                              onClick={() => void onApproveSpec(spec.spec_id)}
+                              className="px-2 py-1 rounded bg-indigo-600 text-white font-semibold text-[10px]"
+                            >
+                              Sign
+                            </button>
+                          )}
+                          {onRunSpec && (
+                            <button
+                              type="button"
+                              onClick={() => void onRunSpec(spec.spec_id)}
+                              className="px-2 py-1 rounded border border-zinc-200 dark:border-zinc-700 text-[10px] hover:bg-zinc-100 dark:hover:bg-zinc-800"
+                            >
+                              Run
+                            </button>
                           )}
                         </div>
                       </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
 
-                      {/* steps trace */}
-                      {(s.steps ?? []).length > 0 && (
-                        <div className="space-y-0.5">
-                          <div className="flex items-center gap-1 text-[9px] uppercase tracking-wider text-zinc-500">Steps</div>
-                          <ol className="space-y-0.5 pl-2 border-l border-white/[0.08] text-[10px]">
-                            {(s.steps ?? []).map((st, i) => (
-                              <li key={i} className="flex gap-1.5">
-                                <span className="text-zinc-600 w-12 shrink-0">{clock(st.ts)}</span>
-                                <span className={st.tone === 'warn' ? 'text-rose-300' : st.tone === 'done' ? 'text-emerald-300' : 'text-zinc-300'}>{st.title}</span>
-                                {st.detail && <span className="text-zinc-500 truncate">{st.detail}</span>}
-                              </li>
-                            ))}
-                          </ol>
+            {/* Graph Section: Idle collapses cleanly; Active shows flow + kill controls */}
+            <div className="px-5 py-4 border-b border-zinc-200 dark:border-zinc-800">
+              {!hasActive ? (
+                <div className="flex items-center justify-between text-[11px] font-mono text-zinc-500 dark:text-zinc-400 py-0.5">
+                  <span>Router idle · {specs.length} specs ready</span>
+                  <span>
+                    {sandbox?.seatbelt_available ? 'Seatbelt' : 'Local'} ·{' '}
+                    {sandbox?.docker_available ? 'Docker ready' : 'Docker off'}
+                  </span>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-[1fr_36px_auto_36px_1fr] items-center gap-0">
+                    <div className="space-y-1.5">
+                      {activeCallers.map(([c, n]) => (
+                        <div
+                          key={c}
+                          className="px-2.5 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#18181B] flex items-center justify-between text-[11px] font-mono"
+                        >
+                          <span className="text-zinc-700 dark:text-zinc-200 truncate">{c}</span>
+                          <span className="text-zinc-400 tabular-nums">{n}</span>
                         </div>
-                      )}
-
-                      <div className="flex flex-wrap gap-x-3 gap-y-1 text-[9px] text-zinc-500">
-                        <span>receipt {s.receipt_id ?? '—'}</span>
-                        <span>{s.tokens_in ?? 0} in · {s.tokens_out ?? 0} out</span>
-                        {s.failover_from && <span>failover from {s.failover_from}</span>}
+                      ))}
+                    </div>
+                    <svg
+                      width="36"
+                      height="12"
+                      viewBox="0 0 36 12"
+                      className="justify-self-center text-indigo-500"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M0 6 H36"
+                        stroke="currentColor"
+                        strokeOpacity={0.75}
+                        strokeWidth={1.4}
+                        fill="none"
+                        className="lb-flow"
+                      />
+                    </svg>
+                    <div className="px-3.5 py-2 rounded-lg border border-indigo-500/40 bg-indigo-500/10 text-center font-mono">
+                      <div className="text-[11px] font-semibold text-indigo-600 dark:text-indigo-400">
+                        Router
+                      </div>
+                      <div className="text-[10px] text-indigo-600/80 dark:text-indigo-300/80 tabular-nums">
+                        {running.length} active
+                        {swarm && swarm.queued_count > 0 ? ` · ${swarm.queued_count} queued` : ''}
                       </div>
                     </div>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
-          {snap.sessions.length > 8 && (
-            <button type="button" onClick={() => setShowAll((v) => !v)} className="text-[9.5px] text-zinc-400 hover:text-zinc-100">
-              {showAll ? 'show fewer' : `show all ${snap.sessions.length}`}
-            </button>
-          )}
-        </section>
+                    <svg
+                      width="36"
+                      height="12"
+                      viewBox="0 0 36 12"
+                      className="justify-self-center text-indigo-500"
+                      aria-hidden="true"
+                    >
+                      <path
+                        d="M0 6 H36"
+                        stroke="currentColor"
+                        strokeOpacity={0.75}
+                        strokeWidth={1.4}
+                        fill="none"
+                        className="lb-flow"
+                      />
+                    </svg>
+                    <div className="space-y-1.5">
+                      {snap.workers_live.slice(0, 4).map((w) => (
+                        <div
+                          key={w.pid}
+                          className="px-2.5 py-1.5 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-zinc-50 dark:bg-[#18181B] flex items-center justify-between gap-1.5 text-[11px] font-mono"
+                        >
+                          <span className="text-zinc-950 dark:text-zinc-100 truncate">
+                            {w.worker}
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => void onKillWorker(w.pid)}
+                            className="text-[10px] text-red-600 dark:text-red-400 hover:underline shrink-0"
+                          >
+                            Kill
+                          </button>
+                        </div>
+                      ))}
+                      {snap.workers_live.length > 4 && (
+                        <div className="text-[10px] font-mono text-zinc-500 text-right tabular-nums">
+                          +{snap.workers_live.length - 4} more running
+                        </div>
+                      )}
+                    </div>
+                  </div>
 
-        <footer className="flex items-center justify-between gap-3 pt-1 text-[9px] font-mono {mutedCls}">
-          <span>~/.lingonberry/config.json · poll 2s</span>
-          <span>{snap.system.app_ram_gb != null ? `app ${snap.system.app_ram_gb.toFixed(2)} GB` : ''}</span>
-        </footer>
-      </div>
+                  {swarm && swarm.active_leases.some((l) => l.lease_state === 'active') && (
+                    <div className="text-[10px] font-mono text-zinc-500 dark:text-zinc-400 flex items-center justify-between pt-1.5 border-t border-zinc-200/70 dark:border-zinc-800/70">
+                      <span>
+                        PathLeases:{' '}
+                        {swarm.active_leases.filter((l) => l.lease_state === 'active').length}
+                      </span>
+                      <span>Merge Queue: {swarm.merge_queue.length}</span>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Compact Sessions Stream */}
+            <div className="px-5 py-4 space-y-3">
+              <div className="flex items-center justify-between gap-2 text-[11px]">
+                <span className="font-semibold text-zinc-950 dark:text-white">
+                  Recent Sessions
+                </span>
+                <div className="flex items-center gap-1 p-0.5 rounded-md bg-zinc-100 dark:bg-[#09090B] border border-zinc-200 dark:border-zinc-800 font-mono text-[10px]">
+                  {(
+                    [
+                      ['all', `all ${snap.sessions.length}`],
+                      ['active', `run ${running.length}`],
+                      ['blocked', `warn ${blocked.length}`],
+                      ['done', `done ${done.length}`],
+                    ] as const
+                  ).map(([key, label]) => (
+                    <button
+                      key={key}
+                      type="button"
+                      onClick={() => setFilter(key)}
+                      className={`px-2 py-0.5 rounded transition-colors ${
+                        filter === key
+                          ? 'bg-white dark:bg-zinc-800 text-zinc-950 dark:text-white font-semibold'
+                          : 'text-zinc-500 dark:text-zinc-400'
+                      }`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {visibleSessions.length === 0 ? (
+                <div className="py-3 text-center text-[11px] font-mono text-zinc-500 dark:text-zinc-400">
+                  No sessions matching filter.
+                </div>
+              ) : (
+                <ul className="divide-y divide-zinc-200 dark:divide-zinc-800">
+                  {visibleSessions.map((s) => {
+                    const open = openId === s.id;
+                    const active = isRunning(s);
+                    return (
+                      <li key={s.id} className="py-2.5 first:pt-0 last:pb-0">
+                        <button
+                          type="button"
+                          onClick={() => setOpenId(open ? null : s.id)}
+                          className="w-full text-left flex items-start justify-between gap-3"
+                        >
+                          <div className="min-w-0 flex-1 space-y-0.5">
+                            <div className="flex flex-wrap items-center gap-x-1.5 text-[10.5px] font-mono text-zinc-500 dark:text-zinc-400">
+                              <span className="tabular-nums">{clock(s.ts)}</span>
+                              <span aria-hidden="true">·</span>
+                              <span className="font-semibold text-zinc-950 dark:text-zinc-200">
+                                {s.caller ?? 'shell'}
+                              </span>
+                              <span aria-hidden="true">→</span>
+                              <span className="font-semibold text-zinc-700 dark:text-zinc-300">
+                                {s.worker}
+                              </span>
+                              {s.sandbox_tier && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span>{s.sandbox_tier}</span>
+                                </>
+                              )}
+                              {s.escalation_from && (
+                                <>
+                                  <span aria-hidden="true">·</span>
+                                  <span className="text-indigo-600 dark:text-indigo-400">
+                                    escalated from {s.escalation_from}
+                                  </span>
+                                </>
+                              )}
+                            </div>
+                            <p className="text-[12px] text-zinc-800 dark:text-zinc-200 truncate">
+                              {s.prompt}
+                            </p>
+                          </div>
+
+                          <div className="text-right font-mono text-[10.5px] shrink-0 tabular-nums">
+                            <div
+                              className={
+                                active
+                                  ? 'text-indigo-600 dark:text-indigo-400 font-semibold'
+                                  : s.state === 'done'
+                                    ? 'text-emerald-600 dark:text-emerald-400'
+                                    : 'text-red-600 dark:text-red-400'
+                              }
+                            >
+                              {s.state}
+                            </div>
+                            <div className="text-zinc-400 dark:text-zinc-500">
+                              {dur(s.duration_s)} · {ago(s.ts)}
+                            </div>
+                          </div>
+                        </button>
+
+                        {open && (
+                          <div className="mt-2 pt-2 border-t border-zinc-200/70 dark:border-zinc-800/70 space-y-1.5 text-[11px] font-mono">
+                            {s.cooked && (
+                              <div className="text-zinc-600 dark:text-zinc-400">
+                                skill: {s.cooked.selected_skill} · hook: {s.cooked.selected_hook} ·
+                                gate: {s.cooked.gate_policy}
+                              </div>
+                            )}
+                            {s.output && (
+                              <div className="p-2 rounded bg-zinc-50 dark:bg-[#09090B] border border-zinc-200 dark:border-zinc-800 text-zinc-700 dark:text-zinc-300">
+                                {s.output}
+                              </div>
+                            )}
+                            {(s.steps ?? []).length > 0 && (
+                              <div className="space-y-0.5 text-[10px] text-zinc-500 dark:text-zinc-400">
+                                {(s.steps ?? []).map((st, idx) => (
+                                  <div key={idx} className="flex gap-2">
+                                    <span className="tabular-nums">{clock(st.ts)}</span>
+                                    <span
+                                      className={
+                                        st.tone === 'warn'
+                                          ? 'text-amber-600 dark:text-amber-400'
+                                          : st.tone === 'done'
+                                            ? 'text-emerald-600 dark:text-emerald-400'
+                                            : 'text-zinc-700 dark:text-zinc-300'
+                                      }
+                                    >
+                                      {st.title}
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+
+            {/* Popover Footer */}
+            <div className="px-5 py-2.5 border-t border-zinc-200 dark:border-zinc-800 bg-zinc-50/70 dark:bg-[#18181B]/45 flex items-center justify-between text-[10.5px] font-mono text-zinc-500 dark:text-zinc-400">
+              <span>~/.lingonberry/config.json</span>
+              <span className="tabular-nums">
+                {snap.system.app_ram_gb != null
+                  ? `menubar ${snap.system.app_ram_gb.toFixed(2)} GB`
+                  : 'SwiftUI + Rust'}
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 };

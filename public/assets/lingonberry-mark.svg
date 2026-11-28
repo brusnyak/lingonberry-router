@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="lb-stem" x1="12" y1="54" x2="48" y2="18" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#059669" />
+      <stop offset="60%" stop-color="#10B981" />
+      <stop offset="100%" stop-color="#84CC16" />
+    </linearGradient>
+    <radialGradient id="lb-berry" cx="38%" cy="32%" r="65%">
+      <stop offset="0%" stop-color="#FB7185" />
+      <stop offset="45%" stop-color="#F43F5E" />
+      <stop offset="100%" stop-color="#BE123C" />
+    </radialGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#090D16" />
+  <path
+    d="M31 52 C31 40 31 31 43 24"
+    stroke="url(#lb-stem)"
+    stroke-width="3.6"
+    stroke-linecap="round"
+  />
+  <path
+    d="M31 44 C26 38 17 38 12 31"
+    stroke="url(#lb-stem)"
+    stroke-width="3.2"
+    stroke-linecap="round"
+  />
+  <path
+    d="M31 35 C27 30 23 29 22 22"
+    stroke="url(#lb-stem)"
+    stroke-width="3.0"
+    stroke-linecap="round"
+  />
+  <path
+    d="M33 49 C36 41 44 40 51 35"
+    stroke="url(#lb-stem)"
+    stroke-width="3.0"
+    stroke-linecap="round"
+  />
+  <circle cx="11.5" cy="30" r="3.4" fill="#94A3B8" />
+  <circle cx="21.5" cy="21" r="3.8" fill="#86EFAC" />
+  <circle cx="52" cy="34.5" r="3.4" fill="#94A3B8" />
+  <path d="M46 13 C42 9 37 9 35 11 C36 14 41 16 45 14 Z" fill="#4ADE80" />
+  <path d="M47 13 C50 8 55 7 58 8 C56 12 51 15 47 14 Z" fill="#22C55E" />
+  <circle cx="46.5" cy="20" r="7.2" fill="url(#lb-berry)" />
+  <ellipse cx="44" cy="17.3" rx="2.1" ry="1.2" transform="rotate(-30 44 17.3)" fill="#FFE4E6" opacity="0.85" />
+</svg>

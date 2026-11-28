@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::discovery::{redact_secrets, resolve_key_value};
+use crate::harness::MINI_HARNESS_SKILLS;
 use crate::registry::Registry;
 use crate::types::{
-    CookedPromptInfo, DiscoveredWorker, DiscoveryData, Receipt, ReceiptExclusion, ReceiptSelection,
-    SelfConfigPlan, SelfConfigTarget,
+    CookedPromptInfo, DiscoveredWorker, DiscoveryData, KeyCostTier, Receipt, ReceiptExclusion,
+    ReceiptSelection, SelfConfigPlan, SelfConfigTarget,
 };
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -25,18 +26,14 @@ struct DiscoveredSkill {
     body: String,
 }
 
-/// Prompt is split into chunks of at most this many chars; longer input runs map-reduce.
 pub const CHUNK_CHARS: usize = 12_000;
-/// Skill body injected into the cooked prompt, capped.
 const SKILL_BODY_CHARS: usize = 4_000;
-/// Default dispatch order: pi, jcode, then the other CLI agents. Direct provider APIs come last.
 pub const WORKER_ORDER: &[&str] = &["pi", "jcode", "omp", "opencode", "kilo", "codex", "claude"];
 const STOPWORDS: &[&str] = &[
     "that", "this", "with", "from", "your", "have", "will", "into", "about", "just", "make",
     "want", "need", "then", "them", "they", "what", "when", "where", "which", "there",
 ];
 
-/// Lowercase alphanumeric words of a text. Whole words only, so "preview" is not "review".
 pub fn word_tokens(text: &str) -> BTreeSet<String> {
     text.to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
@@ -45,7 +42,6 @@ pub fn word_tokens(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-/// True when the keyword occurs as a word or with a plain inflection (s, es, ed, ing).
 pub fn has_word(tokens: &BTreeSet<String>, kw: &str) -> bool {
     tokens.iter().any(|t| {
         t == kw
@@ -60,7 +56,13 @@ pub fn preference_score(w: &DiscoveredWorker) -> f64 {
         .iter()
         .position(|a| *a == w.agent)
         .unwrap_or(WORKER_ORDER.len());
-    1.0 - rank as f64 * 0.05
+    let base = 1.0 - rank as f64 * 0.05;
+    let tier_bonus = match w.cost_tier {
+        KeyCostTier::Local => 0.02,
+        KeyCostTier::FreeTier => 0.01,
+        KeyCostTier::MeteredPaid => -0.03,
+    };
+    base + tier_bonus
 }
 
 fn scan_local_skills(library_dirs: &[String]) -> Vec<DiscoveredSkill> {
@@ -100,6 +102,79 @@ fn scan_local_skills(library_dirs: &[String]) -> Vec<DiscoveredSkill> {
     skills
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ComplexityTier {
+    Trivial,
+    Standard,
+    Complex,
+    Critical,
+}
+
+impl ComplexityTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ComplexityTier::Trivial => "trivial",
+            ComplexityTier::Standard => "standard",
+            ComplexityTier::Complex => "complex",
+            ComplexityTier::Critical => "critical",
+        }
+    }
+}
+
+/// Stage 1: Zero-API-cost structural & blast-radius feature extractor (< 0.2ms).
+pub fn classify_complexity(prompt: &str, use_worktree: bool) -> ComplexityTier {
+    let tokens = word_tokens(prompt);
+    let sensitive_hits = [
+        "auth", "token", "migration", "sql", "schema", "sandbox", "keychain", "delete",
+        "security", "concurrency", "swarm", "rebase", "merge", "architect", "rewrite",
+    ]
+    .iter()
+    .filter(|kw| has_word(&tokens, kw))
+    .count();
+
+    if sensitive_hits >= 2 || (use_worktree && prompt.chars().count() > 240) {
+        ComplexityTier::Critical
+    } else if sensitive_hits == 1
+        || use_worktree
+        || ["refactor", "migrate", "implement", "debug", "fix", "gate", "spec"]
+            .iter()
+            .any(|kw| has_word(&tokens, kw))
+    {
+        if prompt.chars().count() > 140 {
+            ComplexityTier::Complex
+        } else {
+            ComplexityTier::Standard
+        }
+    } else if prompt.chars().count() < 80
+        && ["summarize", "explain", "check", "status", "list", "read"]
+            .iter()
+            .any(|kw| has_word(&tokens, kw))
+    {
+        ComplexityTier::Trivial
+    } else {
+        ComplexityTier::Standard
+    }
+}
+
+/// Computes BM25-inspired weighted semantic match between prompt tokens and candidate text.
+fn semantic_bm25_score(prompt_tokens: &BTreeSet<String>, doc_text: &str) -> f64 {
+    let doc_tokens = word_tokens(doc_text);
+    if doc_tokens.is_empty() || prompt_tokens.is_empty() {
+        return 0.0;
+    }
+    let mut hits = 0.0;
+    for pt in prompt_tokens {
+        if pt.len() < 3 || STOPWORDS.contains(&pt.as_str()) {
+            continue;
+        }
+        if doc_tokens.contains(pt.as_str()) {
+            hits += if pt.len() >= 7 { 1.6 } else { 1.1 };
+        }
+    }
+    let norm = (doc_tokens.len() as f64).sqrt().max(1.0);
+    hits / norm
+}
+
 pub fn cook_prompt(
     raw_prompt: &str,
     discovery: &DiscoveryData,
@@ -107,124 +182,134 @@ pub fn cook_prompt(
     use_worktree: bool,
 ) -> CookedPromptInfo {
     let tokens = word_tokens(raw_prompt);
+    let complexity = classify_complexity(raw_prompt, use_worktree);
 
-    let (task_class, mut selected_skill, selected_command, selected_hook, gate_policy) =
-        if ["bug", "fix", "error", "fail", "crash", "stack", "broken", "debug"]
-            .iter()
-            .any(|kw| has_word(&tokens, kw))
-        {
-            (
-                "debug_fix",
-                "systematic-debugging".to_string(),
-                if use_worktree {
-                    "lingonberry-core run --worktree --gate test".to_string()
-                } else {
-                    "lingonberry-core run --gate test".to_string()
-                },
-                "pre-apply-diff-preview",
-                "test-suite-exit-0",
-            )
-        } else if ["security", "secret", "key", "auth", "audit", "vuln", "review"]
-            .iter()
-            .any(|kw| has_word(&tokens, kw))
-        {
-            (
-                "security_audit",
-                "secure-review-constitution".to_string(),
-                "lingonberry-core run --gate gitleaks".to_string(),
-                "key-redaction-guard",
-                "zero-secret-leak",
-            )
-        } else if [
-            "refactor",
-            "migrate",
-            "port",
-            "rewrite",
+    let archetypes: &[(&str, &str, &str, &str, &str, &str, &str)] = &[
+        (
+            "debug_fix",
+            "systematic-debugging",
+            "bug fix error fail crash stack broken debug trace regression panic",
+            "lingonberry-core run --worktree --gate test",
+            "pre-apply-diff-preview",
+            "test",
+            "maker_checker_loop",
+        ),
+        (
+            "security_audit",
+            "secure-review-constitution",
+            "security secret key auth audit vuln review gitleaks seatbelt sandbox token",
+            "lingonberry-core run --read-only --gate gitleaks",
+            "key-redaction-guard",
+            "gitleaks",
+            "sequential",
+        ),
+        (
+            "engineering_build",
+            "architecture-first-build",
+            "refactor migrate port rewrite build create implement swarm worktree module",
+            "lingonberry-core run --worktree --gate build --approve",
+            "worktree-isolation-hook",
             "build",
-            "create",
-            "implement",
-        ]
-        .iter()
-        .any(|kw| has_word(&tokens, kw))
-        {
-            (
-                "engineering_build",
-                "architecture-first-build".to_string(),
-                if use_worktree {
-                    "lingonberry-core run --worktree --approve".to_string()
-                } else {
-                    "lingonberry-core run --gate build".to_string()
-                },
-                "worktree-isolation-hook",
-                "compile-and-lint-pass",
-            )
-        } else if ["summarize", "explain", "compare", "research", "plan", "check"]
-            .iter()
-            .any(|kw| has_word(&tokens, kw))
-        {
-            (
-                "research_plan",
-                "deep-retrieval-brief".to_string(),
-                "lingonberry-core route --phase plan".to_string(),
-                "source-grounding-hook",
-                "citation-grounded",
-            )
-        } else {
-            (
-                "general_synthesis",
-                "context-retrieval-core".to_string(),
-                format!("lingonberry-core route --phase {phase}"),
-                "receipt-audit-log",
-                "structured-output-check",
-            )
-        };
+            "sequential",
+        ),
+        (
+            "research_plan",
+            "deep-retrieval-brief",
+            "summarize explain compare research plan check spec requirements design",
+            "lingonberry-core route --phase plan",
+            "source-grounding-hook",
+            "none",
+            "single",
+        ),
+    ];
 
-    let local_skills = scan_local_skills(&discovery.library_dirs);
-    let mut best_score = 0usize;
-    let mut selected_body: Option<String> = None;
-    let mut selected_path: Option<String> = None;
-    for sk in local_skills {
-        let hay = word_tokens(&format!("{} {}", sk.name, sk.description));
-        let score = tokens
-            .iter()
-            .filter(|t| t.len() >= 4 && !STOPWORDS.contains(&t.as_str()) && hay.contains(t.as_str()))
-            .count();
-        // Require more than a single shared word before a local skill displaces the default;
-        // otherwise short/plain prompts pick up a mismatched skill body (e.g. score 1.00).
-        if score >= 2 && score > best_score {
-            best_score = score;
-            selected_skill = sk.name.clone();
-            selected_body = Some(sk.body);
-            selected_path = Some(sk.path);
+    let mut best_arch = (
+        "general_synthesis",
+        "deep-retrieval-brief",
+        format!("lingonberry-core route --phase {phase}"),
+        "receipt-audit-log",
+        "none",
+        "single",
+    );
+    let mut best_arch_score = 0.25f64;
+
+    for (cls, skill, lexicon, cmd, hook, gate, wloop) in archetypes {
+        let s = semantic_bm25_score(&tokens, lexicon);
+        if s > best_arch_score {
+            best_arch_score = s;
+            let resolved_cmd = if !use_worktree && cmd.contains("--worktree") {
+                cmd.replace(" --worktree", "")
+            } else {
+                (*cmd).to_string()
+            };
+            best_arch = (cls, skill, resolved_cmd, hook, gate, wloop);
         }
     }
+
+    let (task_class, default_skill_str, selected_command, selected_hook, gate_policy, workflow_loop) =
+        best_arch;
+    let default_skill = default_skill_str.to_string();
+
+    let local_skills = scan_local_skills(&discovery.library_dirs);
+    let mut scored_skills: Vec<(f64, DiscoveredSkill)> = Vec::new();
+    for sk in local_skills {
+        let score = semantic_bm25_score(&tokens, &format!("{} {} {}", sk.name, sk.description, sk.body));
+        if score >= 0.45 {
+            scored_skills.push((score, sk));
+        }
+    }
+    scored_skills.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.name.cmp(&b.1.name))
+    });
+
+    let mut selected_skills: Vec<String> = scored_skills
+        .iter()
+        .take(2)
+        .map(|(_, s)| s.name.clone())
+        .collect();
+    if selected_skills.is_empty() {
+        selected_skills.push(default_skill.clone());
+    }
+    let selected_skill = selected_skills[0].clone();
+
+    let builtin_fallback = MINI_HARNESS_SKILLS
+        .iter()
+        .find(|b| b.id == selected_skill)
+        .map(|b| b.body.to_string());
+
+    let selected_body = scored_skills
+        .first()
+        .map(|(_, s)| s.body.clone())
+        .or(builtin_fallback);
+    let selected_path = scored_skills.first().map(|(_, s)| s.path.clone());
 
     let mut retrieval_sources = Vec::new();
     if let Some(path) = &selected_path {
         retrieval_sources.push(path.clone());
     }
     if discovery.library_dirs.is_empty() {
-        retrieval_sources.push("~/.agent-skills (global constitution)".to_string());
+        retrieval_sources.push("~/.lingonberry/harness/skills (built-in mini-harness)".to_string());
     } else {
         retrieval_sources.extend(discovery.library_dirs.iter().take(2).cloned());
     }
-    if discovery.git_projects.is_empty() {
-        retrieval_sources.push("workspace-context-index".to_string());
-    } else {
+    if !discovery.git_projects.is_empty() {
         retrieval_sources.extend(discovery.git_projects.iter().take(2).cloned());
     }
 
     let sanitized = redact_secrets(raw_prompt.trim());
     let skill_block = match &selected_body {
-        Some(body) => format!("\n[Skill body: {selected_skill}]\n{}\n", redact_secrets(body)),
+        Some(body) => format!("\n[Skill Guide: {selected_skill}]\n{}\n", redact_secrets(body)),
         None => String::new(),
     };
     let cooked_prompt = format!(
-        "[Constitution: global-agentic-skills · {selected_skill}]\n\
-         [Task Class: {task_class} · Command: {selected_command}]\n\
-         [Hook: {selected_hook} · Gate: {gate_policy}]\n\
-         [Retrieved Context: {}]{skill_block}\n\
+        "[Task Ledger · Mode: {phase} · Complexity: {} · Loop: {workflow_loop} · Class: {task_class}]\n\
+         [Skills: {} · Planned Gate: {gate_policy}]\n\
+         [Context Roots: {}]{skill_block}\n\
          Objective: {sanitized}",
+        complexity.as_str(),
+        selected_skills.join(", "),
         retrieval_sources.join(", ")
     );
 
@@ -237,7 +322,40 @@ pub fn cook_prompt(
         selected_hook: selected_hook.to_string(),
         retrieval_sources,
         gate_policy: gate_policy.to_string(),
+        workflow_loop: Some(workflow_loop.to_string()),
+        skills: selected_skills,
     }
+}
+
+/// Escalates a failed or gate-blocked run to a stronger worker along the Big-Three / Subscription
+/// ladder (`pi`/free pools -> `claude` CLI subscription -> `codex` CLI -> approved `metered_paid`).
+pub fn select_escalation_candidate(
+    current_worker: &DiscoveredWorker,
+    registry: &Registry,
+    allow_paid: bool,
+    subscription_headroom: usize,
+) -> Option<DiscoveredWorker> {
+    let workers = registry.list_workers();
+    let mut tier_order: Vec<&str> = Vec::new();
+    if subscription_headroom > 0 {
+        tier_order.extend(["claude", "codex"]);
+    }
+    tier_order.extend(["opencode", "kilo", "pi"]);
+
+    for agent_id in tier_order {
+        if agent_id == current_worker.agent {
+            continue;
+        }
+        if let Some(cand) = workers.iter().find(|w| {
+            w.agent == agent_id
+                && !registry.is_worker_down(&w.id)
+                && (w.path.is_some() || w.base_url.is_some())
+                && (allow_paid || w.cost_tier != KeyCostTier::MeteredPaid)
+        }) {
+            return Some(cand.clone());
+        }
+    }
+    None
 }
 
 fn has_key_available(slot: &str, discovery: &DiscoveryData) -> bool {
@@ -247,7 +365,49 @@ fn has_key_available(slot: &str, discovery: &DiscoveryData) -> bool {
     discovery.keys.values().any(|names| names.iter().any(|n| n == slot))
 }
 
-/// Routes with the owner's full worker set (CLI, tests, the owner's own jobs).
+/// Validates an explicit `--worker` choice against policy rules (non-owner key isolation,
+/// doctor down status, destructive write-access check, and metered/paid key approval).
+pub fn validate_explicit_worker_policy(
+    worker: &DiscoveredWorker,
+    prompt: &str,
+    registry: &Registry,
+    allow_keys: bool,
+    allow_paid: bool,
+) -> Result<(), ReceiptExclusion> {
+    if registry.is_worker_down(&worker.id) {
+        return Err(ReceiptExclusion {
+            candidate_id: worker.id.clone(),
+            code: "DOCTOR_DOWN".into(),
+            evidence: "explicit worker is marked unhealthy".into(),
+        });
+    }
+    let prompt_tokens = word_tokens(prompt);
+    let destructive = ["delete", "rm", "drop", "truncate", "destroy", "wipe", "format"];
+    if destructive.iter().any(|kw| has_word(&prompt_tokens, kw)) && !worker.write_access {
+        return Err(ReceiptExclusion {
+            candidate_id: worker.id.clone(),
+            code: "NO_WRITE_ACCESS".into(),
+            evidence: "destructive prompt cannot target read-only worker".into(),
+        });
+    }
+    let keyed = worker.key_name.is_some() || worker.base_url.is_some();
+    if !allow_keys && keyed {
+        return Err(ReceiptExclusion {
+            candidate_id: worker.id.clone(),
+            code: "KEY_FORBIDDEN".into(),
+            evidence: "API keys are reserved for owner-authenticated requests".into(),
+        });
+    }
+    if !allow_paid && worker.cost_tier == KeyCostTier::MeteredPaid {
+        return Err(ReceiptExclusion {
+            candidate_id: worker.id.clone(),
+            code: "PAID_APPROVAL_REQUIRED".into(),
+            evidence: "metered/paid key requires explicit --approve / owner approval".into(),
+        });
+    }
+    Ok(())
+}
+
 pub fn route_prompt(
     prompt: &str,
     phase: &str,
@@ -256,11 +416,18 @@ pub fn route_prompt(
     registry: &Registry,
     use_worktree: bool,
 ) -> Receipt {
-    route_prompt_with(prompt, phase, caller, discovery, registry, use_worktree, true)
+    route_prompt_with_budget(
+        prompt,
+        phase,
+        caller,
+        discovery,
+        registry,
+        use_worktree,
+        true,
+        true,
+    )
 }
 
-/// `allow_keys = false` for every caller except the owner: API-key workers are excluded, so an
-/// agent that calls the router spends its own configured CLI login, never the owner's keys.
 pub fn route_prompt_with(
     prompt: &str,
     phase: &str,
@@ -270,11 +437,33 @@ pub fn route_prompt_with(
     use_worktree: bool,
     allow_keys: bool,
 ) -> Receipt {
+    route_prompt_with_budget(
+        prompt,
+        phase,
+        caller,
+        discovery,
+        registry,
+        use_worktree,
+        allow_keys,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn route_prompt_with_budget(
+    prompt: &str,
+    phase: &str,
+    caller: Option<&str>,
+    discovery: &DiscoveryData,
+    registry: &Registry,
+    use_worktree: bool,
+    allow_keys: bool,
+    allow_paid: bool,
+) -> Receipt {
     let workers = registry.list_workers();
     let mut exclusions = Vec::new();
     let mut candidates: Vec<DiscoveredWorker> = workers.clone();
 
-    // 1. Skip workers flagged down by doctor
     let down_ids: Vec<String> = candidates
         .iter()
         .filter(|w| registry.is_worker_down(&w.id))
@@ -289,7 +478,6 @@ pub fn route_prompt_with(
         candidates.retain(|w| !registry.is_worker_down(&w.id));
     }
 
-    // 2. Destructive keyword constraint
     let prompt_tokens = word_tokens(prompt);
     let destructive = ["delete", "rm", "drop", "truncate", "destroy", "wipe", "format"];
     if destructive.iter().any(|kw| has_word(&prompt_tokens, kw)) {
@@ -307,7 +495,6 @@ pub fn route_prompt_with(
         }
     }
 
-    // 3. Key availability constraint
     let unkeyed: Vec<String> = candidates
         .iter()
         .filter(|w| {
@@ -332,7 +519,6 @@ pub fn route_prompt_with(
         });
     }
 
-    // 3b. Listed but not dispatchable: a provider key with no known base URL or model
     let is_no_endpoint = |w: &DiscoveredWorker| {
         w.path.is_none() && (w.base_url.is_none() || w.model.is_none())
     };
@@ -350,7 +536,6 @@ pub fn route_prompt_with(
         candidates.retain(|w| !is_no_endpoint(w));
     }
 
-    // 3a. Owner keys are reserved for the owner. Other callers use their own CLI workers only.
     if !allow_keys {
         let keyed = |w: &DiscoveredWorker| w.key_name.is_some() || w.base_url.is_some();
         let forbidden: Vec<String> = candidates
@@ -368,7 +553,22 @@ pub fn route_prompt_with(
         }
     }
 
-    // 4. Key cooldown constraint
+    if !allow_paid {
+        let paid: Vec<String> = candidates
+            .iter()
+            .filter(|w| w.cost_tier == KeyCostTier::MeteredPaid)
+            .map(|w| w.id.clone())
+            .collect();
+        if !paid.is_empty() {
+            exclusions.push(ReceiptExclusion {
+                candidate_id: paid.join(", "),
+                code: "PAID_APPROVAL_REQUIRED".to_string(),
+                evidence: "metered/paid providers stay disabled until --approve or owner budget approval".to_string(),
+            });
+            candidates.retain(|w| w.cost_tier != KeyCostTier::MeteredPaid);
+        }
+    }
+
     let status_map: BTreeMap<String, String> = registry
         .key_status()
         .into_iter()
@@ -444,7 +644,7 @@ pub fn route_prompt_with(
             alternatives: Vec::new(),
             exclusions,
             abstention: Some(
-                "no workers passed constraint filters (add a provider key or install a CLI agent)"
+                "no workers passed constraint filters (add a free/local key, install `pi`, or pass --approve for paid keys)"
                     .to_string(),
             ),
             created_at: Utc::now().to_rfc3339(),
@@ -454,10 +654,6 @@ pub fn route_prompt_with(
     }
 
     let mut scored: Vec<(f64, DiscoveredWorker)> = {
-        // Capacity tiebreak: among workers of the same agent family (all `pi:*` score 1.00),
-        // prefer the provider with the most free key slots. Weight is below the 0.05 agent-rank
-        // gap, so it never promotes a CLI worker over `pi`, only spreads pi traffic across
-        // providers as keys saturate.
         let key_backed = |w: &DiscoveredWorker| w.key_name.is_some() || w.base_url.is_some();
         let max_headroom = candidates
             .iter()
@@ -491,7 +687,11 @@ pub fn route_prompt_with(
             .to_string(),
         ),
         gate: Some(cooked.gate_policy.clone()),
-        reason: format!("score={score:.2} · skill={}", cooked.selected_skill),
+        reason: format!(
+            "score={score:.2} · tier={} · skill={}",
+            w.cost_tier.as_str(),
+            cooked.selected_skill
+        ),
     };
 
     let selected = Some(to_sel(&scored[0]));
@@ -515,8 +715,6 @@ pub fn route_prompt_with(
     }
 }
 
-/// Detects truncated model responses (mid-sentence cutoff or unclosed JSON/code fences)
-/// so the execution engine can automatically retry on a sibling key.
 pub fn is_output_truncated(text: &str, finish_reason: Option<&str>) -> bool {
     if finish_reason == Some("length") || finish_reason == Some("max_tokens") {
         return true;
@@ -654,9 +852,6 @@ pub fn build_self_config_plan(
     }
 }
 
-/// Safely writes global self-config skills/constitution/MCP files and upserts idempotent
-/// `<!-- lingonberry:start -->` light pointer blocks into agent instruction files.
-/// Confined strictly to paths emitted in `plan.targets`.
 pub fn apply_self_config_targets(plan: &SelfConfigPlan, chosen: &BTreeSet<String>) -> Vec<String> {
     let mut applied = Vec::new();
     for target in &plan.targets {
@@ -705,7 +900,6 @@ pub fn apply_self_config_targets(plan: &SelfConfigPlan, chosen: &BTreeSet<String
     applied
 }
 
-/// Calls an OpenAI-compatible provider endpoint using only the resolved key value at request time.
 pub async fn call_provider_api(
     base_url: &str,
     key_name: &str,
@@ -715,10 +909,14 @@ pub async fn call_provider_api(
     let api_key = resolve_key_value(key_name)
         .ok_or_else(|| anyhow::anyhow!("key {key_name} value missing at dispatch time"))?;
     let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
-    // Timeout and token budget are env-tunable: a stalled NIM socket used to hang the run forever,
-    // and 512 tokens is below the reasoning budget of nemotron-3.5-super-vl (empty content, finish=length).
-    let timeout_s: u64 = std::env::var("LINGONBERRY_HTTP_TIMEOUT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(240);
-    let max_tokens: u64 = std::env::var("LINGONBERRY_MAX_TOKENS").ok().and_then(|v| v.parse().ok()).unwrap_or(8192);
+    let timeout_s: u64 = std::env::var("LINGONBERRY_HTTP_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(240);
+    let max_tokens: u64 = std::env::var("LINGONBERRY_MAX_TOKENS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8192);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(timeout_s))
         .user_agent("lingonberry-router/0.1")
@@ -739,9 +937,12 @@ pub async fn call_provider_api(
         anyhow::bail!("HTTP {}", status.as_u16());
     }
     if !status.is_success() {
-        // A 4xx body used to parse as success with empty content, so the gate "passed" on nothing.
         let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("HTTP {}: {}", status.as_u16(), redact_secrets(&text.chars().take(300).collect::<String>()));
+        anyhow::bail!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            redact_secrets(&text.chars().take(300).collect::<String>())
+        );
     }
     let body: serde_json::Value = resp.json().await?;
     let content = body["choices"][0]["message"]["content"]
@@ -752,9 +953,122 @@ pub async fn call_provider_api(
         .as_str()
         .map(str::to_string);
     if content.trim().is_empty() && finish_reason.as_deref() == Some("length") {
-        anyhow::bail!("truncated: empty content at max_tokens={max_tokens} (raise LINGONBERRY_MAX_TOKENS)");
+        anyhow::bail!(
+            "truncated: empty content at max_tokens={max_tokens} (raise LINGONBERRY_MAX_TOKENS)"
+        );
     }
     Ok((redact_secrets(&content), finish_reason))
+}
+
+/// Forwards an OpenAI-compatible chat-completions JSON payload from `pi-rust` through an owner
+/// key slot without exposing the raw API key to `pi-rust`.
+pub async fn proxy_provider_chat(
+    base_url: &str,
+    key_name: &str,
+    mut payload: serde_json::Value,
+    fallback_model: Option<&str>,
+) -> anyhow::Result<serde_json::Value> {
+    let api_key = resolve_key_value(key_name)
+        .ok_or_else(|| anyhow::anyhow!("key {key_name} value missing at dispatch time"))?;
+    if payload.get("model").and_then(|v| v.as_str()).unwrap_or("").is_empty() {
+        if let Some(m) = fallback_model {
+            payload["model"] = serde_json::Value::String(m.to_string());
+        }
+    }
+    payload["stream"] = serde_json::Value::Bool(false);
+    let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(240))
+        .user_agent("lingonberry-router-proxy/0.1")
+        .build()?;
+    let resp = client
+        .post(&endpoint)
+        .bearer_auth(api_key)
+        .json(&payload)
+        .send()
+        .await?;
+    let status = resp.status();
+    if status.as_u16() == 429 || status.is_server_error() {
+        anyhow::bail!("HTTP {}", status.as_u16());
+    }
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            redact_secrets(&text.chars().take(300).collect::<String>())
+        );
+    }
+    let json: serde_json::Value = resp.json().await?;
+    Ok(json)
+}
+
+pub fn chunk_text(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for para in text.split("\n\n") {
+        if para.trim().is_empty() {
+            continue;
+        }
+        let mut rest = para.to_string();
+        while rest.chars().count() > max {
+            if !cur.is_empty() {
+                out.push(std::mem::take(&mut cur));
+            }
+            out.push(rest.chars().take(max).collect());
+            rest = rest.chars().skip(max).collect();
+        }
+        let sep = if cur.is_empty() { 0 } else { 2 };
+        if !cur.is_empty() && cur.chars().count() + sep + rest.chars().count() > max {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push_str("\n\n");
+        }
+        cur.push_str(&rest);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+pub async fn call_chunked(
+    base_url: &str,
+    key_name: &str,
+    model: &str,
+    cooked: &CookedPromptInfo,
+) -> anyhow::Result<(String, Option<String>)> {
+    let chunks = chunk_text(&cooked.raw_prompt, CHUNK_CHARS);
+    if chunks.len() <= 1 {
+        return call_provider_api(base_url, key_name, model, &cooked.cooked_prompt).await;
+    }
+    let header = cooked
+        .cooked_prompt
+        .split("\nObjective: ")
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let n = chunks.len();
+    let mut parts = Vec::with_capacity(n);
+    for (i, chunk) in chunks.iter().enumerate() {
+        let prompt = format!(
+            "{header}\nObjective: [chunk {} of {n} of a longer input; answer what this chunk supports]\n\n{chunk}",
+            i + 1
+        );
+        let (text, _) = call_provider_api(base_url, key_name, model, &prompt).await?;
+        parts.push(format!("## Chunk {}/{n}\n{}", i + 1, text.trim()));
+    }
+    let reduce = format!(
+        "{header}\nObjective: {}\n\nMerge these per-chunk answers into one complete answer to the objective. Remove duplicates, keep every distinct finding.\n\n{}",
+        cooked.raw_prompt,
+        parts.join("\n\n")
+    );
+    call_provider_api(base_url, key_name, model, &reduce).await
 }
 
 #[cfg(test)]
@@ -772,6 +1086,7 @@ mod tests {
             git_projects: vec![],
             browsers: vec![],
             stores: vec![],
+            keychain_slots: vec![],
         };
         discovery.keys.insert("nim".into(), vec!["NIM_1".into()]);
         discovery.providers.insert(
@@ -782,13 +1097,19 @@ mod tests {
                 style: Some("openai".into()),
             },
         );
-        // crush is not in WRITE_AGENTS, so it is the read-only worker this test needs.
         discovery.agents.push(crate::types::Agent {
             id: "crush".into(),
             path: Some("/bin/true".into()),
         });
         let reg = Registry::new(&discovery, &Config::default());
-        let rcpt = route_prompt("delete stale build artifacts", "execute", Some("shell"), &discovery, &reg, false);
+        let rcpt = route_prompt(
+            "delete stale build artifacts",
+            "execute",
+            Some("shell"),
+            &discovery,
+            &reg,
+            false,
+        );
         assert!(rcpt.exclusions.iter().any(|e| e.code == "NO_WRITE_ACCESS"));
     }
 
@@ -803,12 +1124,90 @@ mod tests {
             git_projects: vec![],
             browsers: vec![],
             stores: vec![],
+            keychain_slots: vec![],
         };
         discovery.keys.insert("groq".into(), vec!["GROQ_API_KEY".into()]);
         let reg = Registry::new(&discovery, &Config::default());
         reg.mark_worker_down("pi:groq", true);
         let rcpt = route_prompt("summarize logs", "plan", Some("shell"), &discovery, &reg, false);
         assert!(rcpt.exclusions.iter().any(|e| e.code == "DOCTOR_DOWN"));
+    }
+
+    #[test]
+    fn paid_worker_is_excluded_without_approval() {
+        let mut discovery = DiscoveryData {
+            agents: vec![],
+            keys: BTreeMap::new(),
+            providers: BTreeMap::new(),
+            library_dirs: vec![],
+            ssh_hosts: vec![],
+            git_projects: vec![],
+            browsers: vec![],
+            stores: vec![],
+            keychain_slots: vec![],
+        };
+        discovery.keys.insert("openai".into(), vec!["OPENAI_API_KEY".into()]);
+        discovery.providers.insert(
+            "openai".into(),
+            crate::types::Provider {
+                id: "openai".into(),
+                base_url: "https://api.openai.com/v1".into(),
+                style: Some("openai".into()),
+            },
+        );
+        let reg = Registry::new(&discovery, &Config::default());
+        let rcpt = route_prompt_with_budget(
+            "summarize logs",
+            "plan",
+            Some("shell"),
+            &discovery,
+            &reg,
+            false,
+            true,
+            false,
+        );
+        assert!(rcpt.exclusions.iter().any(|e| e.code == "PAID_APPROVAL_REQUIRED"));
+        assert!(rcpt.selected.is_none());
+    }
+
+    #[test]
+    fn explicit_worker_policy_rejects_paid_and_key_forbidden() {
+        let w = DiscoveredWorker {
+            id: "pi:openai".into(),
+            agent: "pi".into(),
+            key_name: None,
+            provider: "openai".into(),
+            base_url: Some("https://api.openai.com/v1".into()),
+            model: Some("gpt-4.1".into()),
+            write_access: true,
+            path: None,
+            cost_tier: KeyCostTier::MeteredPaid,
+        };
+        let disc = DiscoveryData {
+            agents: vec![],
+            keys: BTreeMap::new(),
+            providers: BTreeMap::new(),
+            library_dirs: vec![],
+            ssh_hosts: vec![],
+            git_projects: vec![],
+            browsers: vec![],
+            stores: vec![],
+            keychain_slots: vec![],
+        };
+        let reg = Registry::new(&disc, &Config::default());
+        assert_eq!(
+            validate_explicit_worker_policy(&w, "hi", &reg, false, true)
+                .unwrap_err()
+                .code,
+            "KEY_FORBIDDEN"
+        );
+        assert_eq!(
+            validate_explicit_worker_policy(&w, "hi", &reg, true, false)
+                .unwrap_err()
+                .code,
+            "PAID_APPROVAL_REQUIRED"
+        );
+        assert!(validate_explicit_worker_policy(&w, "hi", &reg, true, true).is_ok());
     }
 
     #[test]
@@ -847,83 +1246,6 @@ mod tests {
         assert_eq!(final_text.matches("<!-- lingonberry:start -->").count(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
-}
-
-/// Splits text at blank lines into pieces of at most `max` chars. Paragraphs longer than `max`
-/// are hard-split. Never returns an empty list.
-pub fn chunk_text(text: &str, max: usize) -> Vec<String> {
-    let max = max.max(1);
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    for para in text.split("\n\n") {
-        if para.trim().is_empty() {
-            continue;
-        }
-        let mut rest = para.to_string();
-        while rest.chars().count() > max {
-            if !cur.is_empty() {
-                out.push(std::mem::take(&mut cur));
-            }
-            out.push(rest.chars().take(max).collect());
-            rest = rest.chars().skip(max).collect();
-        }
-        let sep = if cur.is_empty() { 0 } else { 2 };
-        if !cur.is_empty() && cur.chars().count() + sep + rest.chars().count() > max {
-            out.push(std::mem::take(&mut cur));
-        }
-        if !cur.is_empty() {
-            cur.push_str("\n\n");
-        }
-        cur.push_str(&rest);
-    }
-    if !cur.trim().is_empty() {
-        out.push(cur);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
-}
-
-/// One provider call, or map-reduce when the objective is longer than CHUNK_CHARS.
-/// Map: each chunk is answered under the same header. Reduce: one call merges the answers.
-pub async fn call_chunked(
-    base_url: &str,
-    key_name: &str,
-    model: &str,
-    cooked: &CookedPromptInfo,
-) -> anyhow::Result<(String, Option<String>)> {
-    let chunks = chunk_text(&cooked.raw_prompt, CHUNK_CHARS);
-    if chunks.len() <= 1 {
-        return call_provider_api(base_url, key_name, model, &cooked.cooked_prompt).await;
-    }
-    let header = cooked
-        .cooked_prompt
-        .split("\nObjective: ")
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let n = chunks.len();
-    let mut parts = Vec::with_capacity(n);
-    for (i, chunk) in chunks.iter().enumerate() {
-        let prompt = format!(
-            "{header}\nObjective: [chunk {} of {n} of a longer input; answer what this chunk supports]\n\n{chunk}",
-            i + 1
-        );
-        let (text, _) = call_provider_api(base_url, key_name, model, &prompt).await?;
-        parts.push(format!("## Chunk {}/{n}\n{}", i + 1, text.trim()));
-    }
-    let reduce = format!(
-        "{header}\nObjective: {}\n\nMerge these per-chunk answers into one complete answer to the objective. Remove duplicates, keep every distinct finding.\n\n{}",
-        cooked.raw_prompt,
-        parts.join("\n\n")
-    );
-    call_provider_api(base_url, key_name, model, &reduce).await
-}
-
-#[cfg(test)]
-mod prompt_tests {
-    use super::*;
 
     #[test]
     fn whole_word_matching_ignores_substrings() {
@@ -944,7 +1266,9 @@ mod prompt_tests {
             .join("\n\n");
         let chunks = chunk_text(&text, 200);
         assert!(chunks.len() > 1);
-        assert!(chunks.iter().all(|c| !c.trim().is_empty() && c.chars().count() <= 200));
+        assert!(chunks
+            .iter()
+            .all(|c| !c.trim().is_empty() && c.chars().count() <= 200));
         let joined = chunks.join(" ");
         for i in 0..6 {
             assert!(joined.contains(&format!("para{i}")));
@@ -974,6 +1298,7 @@ mod prompt_tests {
             model: None,
             write_access: true,
             path: None,
+            cost_tier: KeyCostTier::FreeTier,
         };
         assert!(preference_score(&mk("pi")) > preference_score(&mk("jcode")));
         assert!(preference_score(&mk("jcode")) > preference_score(&mk("claude")));

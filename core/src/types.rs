@@ -1,6 +1,33 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyCostTier {
+    Local,
+    #[default]
+    FreeTier,
+    MeteredPaid,
+}
+
+impl KeyCostTier {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            KeyCostTier::Local => "local",
+            KeyCostTier::FreeTier => "free_tier",
+            KeyCostTier::MeteredPaid => "metered_paid",
+        }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "local" | "local_free" => KeyCostTier::Local,
+            "metered" | "paid" | "metered_paid" => KeyCostTier::MeteredPaid,
+            _ => KeyCostTier::FreeTier,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Provider {
     pub id: String,
@@ -71,6 +98,10 @@ pub struct CookedPromptInfo {
     pub selected_hook: String,
     pub retrieval_sources: Vec<String>,
     pub gate_policy: String,
+    #[serde(default)]
+    pub workflow_loop: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,8 +117,18 @@ pub struct Run {
     pub gate: Option<String>,
     pub state: RunState,
     pub pid: Option<u32>,
+    #[serde(default)]
+    pub os_pid: Option<u32>,
     pub elapsed_ms: Option<u64>,
     pub gate_passed: Option<bool>,
+    #[serde(default)]
+    pub gate_status: Option<String>,
+    #[serde(default)]
+    pub worktree_path: Option<String>,
+    #[serde(default)]
+    pub cost_tier: Option<String>,
+    #[serde(default)]
+    pub budget_approved: Option<bool>,
     pub error: Option<String>,
     pub output: Option<String>,
     pub task_class: Option<String>,
@@ -96,6 +137,14 @@ pub struct Run {
     pub steps: Vec<SessionStep>,
     pub fanout_group: Option<String>,
     pub failover_from: Option<String>,
+    #[serde(default)]
+    pub escalation_from: Option<String>,
+    #[serde(default)]
+    pub sandbox_tier: Option<String>,
+    #[serde(default)]
+    pub complexity_tier: Option<String>,
+    #[serde(default)]
+    pub spec_id: Option<String>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
 }
@@ -123,6 +172,12 @@ pub struct WorkerStatus {
     pub cooling_remaining_s: u64,
     pub rpm_limit: usize,
     pub inflight: usize,
+    #[serde(default)]
+    pub cost_tier: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub fail_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -148,6 +203,8 @@ pub struct SessionRow {
     pub worker: String,
     pub caller: Option<String>,
     pub key: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
     pub state: String,
     pub duration_s: f64,
     pub reason: Option<String>,
@@ -159,12 +216,28 @@ pub struct SessionRow {
     pub failover_from: Option<String>,
     pub tokens_in: Option<u64>,
     pub tokens_out: Option<u64>,
+    #[serde(default)]
+    pub gate_status: Option<String>,
+    #[serde(default)]
+    pub cost_tier: Option<String>,
+    #[serde(default)]
+    pub escalation_from: Option<String>,
+    #[serde(default)]
+    pub sandbox_tier: Option<String>,
+    #[serde(default)]
+    pub complexity_tier: Option<String>,
+    #[serde(default)]
+    pub spec_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobRow {
     pub name: String,
     pub source: String,
+    #[serde(default = "default_job_scope")]
+    pub scope: String,
+    #[serde(default)]
+    pub read_only: bool,
     pub schedule: String,
     pub command: String,
     pub every_s: Option<u64>,
@@ -180,6 +253,10 @@ pub struct JobRow {
     pub auto_restart: bool,
     pub last_error: Option<String>,
     pub log_tail: Vec<String>,
+}
+
+fn default_job_scope() -> String {
+    "managed".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -208,7 +285,6 @@ pub struct SystemInfo {
     pub ram_total_gb: Option<f64>,
     pub disk_used_gb: Option<f64>,
     pub disk_total_gb: Option<f64>,
-    /// This app only (core, plus the tray when it is the parent): CPU in percent of one core, RAM in GB.
     #[serde(default)]
     pub app_cpu_pct: Option<f64>,
     #[serde(default)]
@@ -225,6 +301,45 @@ pub struct TelemetryPoint {
     pub rpm: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ReadinessReport {
+    pub pi_installed: bool,
+    pub pi_path: Option<String>,
+    pub mini_harness_ready: bool,
+    pub agents_count: usize,
+    pub free_keys_count: usize,
+    pub paid_keys_count: usize,
+    pub external_skills_count: usize,
+    pub mode: String,
+    pub recommendations: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OvernightTicket {
+    pub id: String,
+    pub title: String,
+    pub prompt: String,
+    pub repo_path: Option<String>,
+    pub status: String,
+    pub cost_tier: String,
+    pub estimated_tokens: u64,
+    pub created_at: String,
+    pub run_id: Option<String>,
+    pub gate_status: Option<String>,
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OvernightSummary {
+    pub enabled: bool,
+    pub free_only: bool,
+    pub nightly_budget_usd: f64,
+    pub spent_today_usd: f64,
+    pub runs_tonight: usize,
+    pub max_runs_per_night: usize,
+    pub tickets: Vec<OvernightTicket>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub ts: f64,
@@ -237,6 +352,20 @@ pub struct Snapshot {
     pub router: RouterState,
     pub system: SystemInfo,
     pub telemetry: Vec<TelemetryPoint>,
+    #[serde(default)]
+    pub readiness: ReadinessReport,
+    #[serde(default)]
+    pub overnight: OvernightSummary,
+    #[serde(default)]
+    pub watchdog: Option<crate::watchdog::WatchdogStatus>,
+    #[serde(default)]
+    pub sandbox: Option<crate::sandbox::SandboxHealth>,
+    #[serde(default)]
+    pub swarm: Option<crate::swarm::SwarmSummary>,
+    #[serde(default)]
+    pub gateway: Option<crate::channels::GatewayMemorySummary>,
+    #[serde(default)]
+    pub specs: Vec<crate::spec_engine::KiroSpecManifest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +412,8 @@ pub struct DiscoveredWorker {
     pub model: Option<String>,
     pub write_access: bool,
     pub path: Option<String>,
+    #[serde(default)]
+    pub cost_tier: KeyCostTier,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,9 +425,21 @@ pub struct DiscoveryData {
     pub ssh_hosts: Vec<String>,
     pub git_projects: Vec<String>,
     pub browsers: Vec<String>,
-    /// Key names found in other agents' credential stores. Names and providers only, never values.
     #[serde(default)]
     pub stores: Vec<crate::stores::StoreKey>,
+    #[serde(default)]
+    pub keychain_slots: Vec<KeychainSlotMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeychainSlotMeta {
+    pub slot: String,
+    pub provider: String,
+    pub label: String,
+    pub cost_tier: String,
+    pub rpm_limit: Option<usize>,
+    pub base_url: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

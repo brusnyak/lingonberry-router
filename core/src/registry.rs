@@ -1,6 +1,7 @@
 use crate::config::Config;
 use crate::discovery::build_workers;
-use crate::types::{DiscoveredWorker, DiscoveryData, WorkerStatus};
+use crate::harness::infer_cost_tier;
+use crate::types::{DiscoveredWorker, DiscoveryData, KeyCostTier, WorkerStatus};
 use anyhow::{bail, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub struct KeyState {
     pub name: String,
     pub provider: String,
+    pub cost_tier: KeyCostTier,
+    pub source: String,
     pub cooling_until: f64,
     pub inflight: usize,
     pub ok: usize,
@@ -35,13 +38,11 @@ pub struct RegistryInner {
     pub default_worker: String,
 }
 
-/// Thread-safe worker & key registry with RAII LeaseGuard.
 #[derive(Clone)]
 pub struct Registry {
     inner: Arc<Mutex<RegistryInner>>,
 }
 
-/// RAII lease guard: automatically releases the leased inflight slot on Drop if not explicitly committed.
 pub struct LeaseGuard {
     registry: Registry,
     key_name: String,
@@ -59,9 +60,6 @@ impl LeaseGuard {
         self.released = true;
     }
 
-    /// Release the leased inflight slot without counting ok/fail or cooling. For paths where a
-    /// key was leased but never actually called (e.g. no executor handled the worker), so a
-    /// healthy key is not penalized for work that never happened.
     pub fn cancel(mut self) {
         if let Some(k) = self.registry.inner.lock().unwrap().keys.get_mut(&self.key_name) {
             k.inflight = k.inflight.saturating_sub(1);
@@ -73,9 +71,49 @@ impl LeaseGuard {
 impl Drop for LeaseGuard {
     fn drop(&mut self) {
         if !self.released {
-            // Panic or early cancel safety: never leak inflight capacity
             self.registry.release_key(&self.key_name, false, Some(5));
         }
+    }
+}
+
+fn build_key_state(
+    name: &str,
+    provider: &str,
+    discovery: &DiscoveryData,
+    cfg: &Config,
+) -> KeyState {
+    let tier = cfg
+        .key_tiers
+        .get(name)
+        .or_else(|| cfg.key_tiers.get(provider))
+        .map(|s| KeyCostTier::from_str(s))
+        .or_else(|| {
+            discovery
+                .keychain_slots
+                .iter()
+                .find(|m| m.slot == name)
+                .map(|m| KeyCostTier::from_str(&m.cost_tier))
+        })
+        .unwrap_or_else(|| infer_cost_tier(provider, Some(name)));
+
+    let source = if name.starts_with("kc:") {
+        "keychain".to_string()
+    } else if let Some(rest) = name.strip_prefix("store:") {
+        rest.split('|').next().unwrap_or("store").to_string()
+    } else {
+        "env".to_string()
+    };
+
+    KeyState {
+        name: name.to_string(),
+        provider: provider.to_string(),
+        cost_tier: tier,
+        source,
+        cooling_until: 0.0,
+        inflight: 0,
+        ok: 0,
+        fail: 0,
+        window: Vec::new(),
     }
 }
 
@@ -88,21 +126,17 @@ impl Registry {
             .collect();
         workers.sort_by(|a, b| a.id.cmp(&b.id));
 
+        let mut provider_rpm_caps = cfg.provider_rpm.clone();
+        for kc in &discovery.keychain_slots {
+            if let Some(rpm) = kc.rpm_limit {
+                provider_rpm_caps.insert(kc.provider.clone(), rpm);
+            }
+        }
+
         let mut keys = BTreeMap::new();
         for (provider, names) in &discovery.keys {
             for name in names {
-                keys.insert(
-                    name.clone(),
-                    KeyState {
-                        name: name.clone(),
-                        provider: provider.clone(),
-                        cooling_until: 0.0,
-                        inflight: 0,
-                        ok: 0,
-                        fail: 0,
-                        window: Vec::new(),
-                    },
-                );
+                keys.insert(name.clone(), build_key_state(name, provider, discovery, cfg));
             }
         }
 
@@ -112,7 +146,7 @@ impl Registry {
                 keys,
                 down_workers: BTreeSet::new(),
                 rpm_limit: cfg.rpm_per_key,
-                provider_rpm_caps: cfg.provider_rpm.clone(),
+                provider_rpm_caps,
                 cooldown_s: cfg.cooldown_s,
                 max_inflight: cfg.max_inflight_per_key,
                 default_worker: cfg.default_worker.clone(),
@@ -133,23 +167,31 @@ impl Registry {
         for (prov, rpm) in &cfg.provider_rpm {
             guard.provider_rpm_caps.entry(prov.clone()).or_insert(*rpm);
         }
+        for kc in &discovery.keychain_slots {
+            if let Some(rpm) = kc.rpm_limit {
+                guard.provider_rpm_caps.insert(kc.provider.clone(), rpm);
+            }
+        }
         guard.cooldown_s = cfg.cooldown_s;
         guard.max_inflight = cfg.max_inflight_per_key;
         guard.default_worker = cfg.default_worker.clone();
 
+        let mut live_names = BTreeSet::new();
         for (provider, names) in &discovery.keys {
             for name in names {
-                guard.keys.entry(name.clone()).or_insert_with(|| KeyState {
-                    name: name.clone(),
-                    provider: provider.clone(),
-                    cooling_until: 0.0,
-                    inflight: 0,
-                    ok: 0,
-                    fail: 0,
-                    window: Vec::new(),
-                });
+                live_names.insert(name.clone());
+                let fresh = build_key_state(name, provider, discovery, cfg);
+                guard
+                    .keys
+                    .entry(name.clone())
+                    .and_modify(|k| {
+                        k.cost_tier = fresh.cost_tier.clone();
+                        k.source = fresh.source.clone();
+                    })
+                    .or_insert(fresh);
             }
         }
+        guard.keys.retain(|k, _| live_names.contains(k));
     }
 
     pub fn set_rpm_limit(&self, target: &str, rpm: usize) -> bool {
@@ -182,7 +224,6 @@ impl Registry {
             .cloned()
     }
 
-    /// Free dispatch slots for a provider right now, from an already-held lock.
     fn headroom_in(inner: &RegistryInner, provider: &str, now: f64) -> usize {
         inner
             .keys
@@ -205,9 +246,6 @@ impl Registry {
             .sum()
     }
 
-    /// Free dispatch slots for a provider right now: sum over its keys of
-    /// min(remaining calls in the 60s window, inflight headroom). Cooling keys count 0.
-    /// Used to spread owner traffic across providers instead of pinning the first one.
     pub fn provider_headroom(&self, provider: &str) -> usize {
         let guard = self.inner.lock().unwrap();
         Self::headroom_in(&guard, provider, now_sec())
@@ -217,9 +255,11 @@ impl Registry {
         self.inner.lock().unwrap().default_worker.clone()
     }
 
-    /// The pi worker with the most free key slots, skipping `exclude`. Used as the default
-    /// executor for owner keys and as a lease-time failover when routing raced the pool.
-    pub fn select_best_worker_excluding(&self, exclude: Option<&str>) -> Option<DiscoveredWorker> {
+    pub fn select_best_worker_excluding_tier(
+        &self,
+        exclude: Option<&str>,
+        allow_paid: bool,
+    ) -> Option<DiscoveredWorker> {
         let guard = self.inner.lock().unwrap();
         let now = now_sec();
         let mut best: Option<(usize, DiscoveredWorker)> = None;
@@ -230,8 +270,10 @@ impl Registry {
             if exclude == Some(w.id.as_str()) {
                 continue;
             }
-            let eligible = (w.agent == "pi" && w.key_name.is_none())
-                || w.key_name.is_some();
+            if !allow_paid && w.cost_tier == KeyCostTier::MeteredPaid {
+                continue;
+            }
+            let eligible = (w.agent == "pi" && w.key_name.is_none()) || w.key_name.is_some();
             if !eligible {
                 continue;
             }
@@ -250,6 +292,10 @@ impl Registry {
         best.map(|(_, w)| w)
     }
 
+    pub fn select_best_worker_excluding(&self, exclude: Option<&str>) -> Option<DiscoveredWorker> {
+        self.select_best_worker_excluding_tier(exclude, false)
+    }
+
     pub fn mark_worker_down(&self, worker_id: &str, down: bool) {
         let mut guard = self.inner.lock().unwrap();
         if down {
@@ -264,8 +310,7 @@ impl Registry {
     }
 
     pub fn select_best_worker(&self) -> Option<DiscoveredWorker> {
-        // Owner-key dispatch goes to whichever provider has the most free key slots.
-        if let Some(w) = self.select_best_worker_excluding(None) {
+        if let Some(w) = self.select_best_worker_excluding_tier(None, false) {
             return Some(w);
         }
         let guard = self.inner.lock().unwrap();
@@ -273,12 +318,9 @@ impl Registry {
             .workers
             .iter()
             .filter(|w| !guard.down_workers.contains(&w.id))
+            .filter(|w| w.cost_tier != KeyCostTier::MeteredPaid)
             .collect();
 
-        // Preference order:
-        // 1. pi workers (agent == "pi", no key slot) — external API calls, no local process
-        // 2. Local CLI workers with no key slot (claude, codex, opencode, kilo, omp)
-        // 3. Any available worker
         available
             .iter()
             .find(|w| w.agent == "pi" && w.key_name.is_none())
@@ -353,6 +395,7 @@ impl Registry {
             b_pref
                 .cmp(&a_pref)
                 .then(ka.inflight.cmp(&kb.inflight))
+                .then(ka.fail.cmp(&kb.fail))
                 .then(ka.window.len().cmp(&kb.window.len()))
         });
 
@@ -448,6 +491,9 @@ impl Registry {
                     cooling_remaining_s: cooling_left,
                     rpm_limit,
                     inflight: k.inflight,
+                    cost_tier: Some(k.cost_tier.as_str().to_string()),
+                    source: Some(k.source.clone()),
+                    fail_count: k.fail,
                 }
             })
             .collect()
@@ -481,6 +527,7 @@ mod tests {
             git_projects: vec![],
             browsers: vec![],
             stores: vec![],
+            keychain_slots: vec![],
         }
     }
 
@@ -495,7 +542,7 @@ mod tests {
                 status.iter().find(|k| k.name == "NIM_1").unwrap().status,
                 "active"
             );
-        } // dropped without complete()
+        }
         let after = reg.key_status();
         assert_eq!(
             after.iter().find(|k| k.name == "NIM_1").unwrap().status,

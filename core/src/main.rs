@@ -1,10 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use lingonberry_core::agents::{apply_self_config_targets, build_self_config_plan, route_prompt};
-use lingonberry_core::config::{load_config, validate_config, write_default_config};
-use lingonberry_core::discovery::{configure_pi_rust, scan_discovery};
+use lingonberry_core::config::{
+    api_token_path, ensure_api_token, load_config, validate_config, write_default_config,
+};
+use lingonberry_core::discovery::{configure_pi_rust, recommended_pi_install_cmd, scan_discovery};
+use lingonberry_core::harness::{build_readiness_report, ensure_mini_harness};
 use lingonberry_core::registry::Registry;
-use lingonberry_core::server::{build_router, dispatch_run_async, serve, AppState};
+use lingonberry_core::server::{build_router, dispatch_run_async, serve, AppState, DispatchOptions};
 use lingonberry_core::storage::SqliteStore;
 use lingonberry_core::types::RunState;
 use std::collections::BTreeSet;
@@ -19,12 +22,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize ~/.lingonberry/config.json and logs directory
+    /// Initialize ~/.lingonberry/config.json, bearer token, mini-harness, and pi-rust proxy
     Init {
         #[arg(long)]
         force: bool,
+        #[arg(long)]
+        yes: bool,
     },
-    /// Read-only health check printed as JSON
+    /// Read-only health & readiness check printed as JSON
     Doctor,
     /// Print discovered agents, key names, providers, and library dirs
     Discover,
@@ -49,6 +54,21 @@ enum Commands {
         worktree: bool,
         #[arg(long)]
         live_api: bool,
+        /// Verification gate command/preset to run before marking gate_passed (e.g. test, build, gitleaks, or custom cmd)
+        #[arg(long)]
+        gate: Option<String>,
+        /// Approve metered/paid keys or open-ended execution
+        #[arg(long)]
+        approve: bool,
+        /// Enforce read-only / non-mutating intent
+        #[arg(long)]
+        read_only: bool,
+        /// Optional approved Kiro Spec ID locking overnight / scoped execution
+        #[arg(long)]
+        spec: Option<String>,
+        /// Sandbox tier override (seatbelt | docker | worktree_only)
+        #[arg(long)]
+        sandbox: Option<String>,
     },
     /// Dispatch multiple prompts in parallel across workers
     Fanout {
@@ -57,6 +77,8 @@ enum Commands {
         caller: Option<String>,
         #[arg(long)]
         worktree: bool,
+        #[arg(long)]
+        approve: bool,
     },
     /// Preview or apply global-first self-configuration pointers
     SelfConfig {
@@ -77,20 +99,42 @@ async fn main() -> Result<()> {
     lingonberry_core::discovery::ensure_tool_path();
     let cli = Cli::parse();
     match cli.command {
-        Commands::Init { force } => {
+        Commands::Init { force, yes } => {
             let cfg_path = write_default_config(force)?;
+            let _ = ensure_api_token()?;
+            let _ = ensure_mini_harness();
             let disc = scan_discovery();
             let cfg = load_config()?;
             let plan = build_self_config_plan(&disc, &cfg, &BTreeSet::new());
-            // Auto-configure pi-rust credentials from discovered keys
             if let Some(home) = dirs::home_dir() {
                 let _ = configure_pi_rust(&home, &disc);
+            }
+            let readiness = build_readiness_report(&disc, &cfg.key_tiers);
+            let mut pi_install_note: Option<String> = None;
+            if !readiness.pi_installed {
+                if let Some((prog, args)) = recommended_pi_install_cmd() {
+                    if yes {
+                        let status = std::process::Command::new(prog).args(&args).status();
+                        pi_install_note = Some(match status {
+                            Ok(s) if s.success() => "pi-rust installed".into(),
+                            Ok(s) => format!("pi-rust install exited {:?}", s.code()),
+                            Err(e) => format!("pi-rust install error: {e}"),
+                        });
+                    } else {
+                        pi_install_note = Some(format!(
+                            "pi-rust missing; run `{prog} {}` or re-run with `lingonberry-core init --yes`",
+                            args.join(" ")
+                        ));
+                    }
+                }
             }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "ok": true,
                     "config_path": cfg_path,
+                    "readiness": readiness,
+                    "pi_install": pi_install_note,
                     "self_config": plan
                 }))?
             );
@@ -101,15 +145,21 @@ async fn main() -> Result<()> {
             let disc = scan_discovery();
             let reg = Registry::new(&disc, &cfg);
             let workers = reg.list_workers();
-            let ok = !workers.is_empty();
+            let readiness = build_readiness_report(&disc, &cfg.key_tiers);
+            let token_ok = api_token_path().exists();
+            let ok = token_ok && readiness.mini_harness_ready;
+            let needs_keys = workers.is_empty();
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
                     "ok": ok,
+                    "token_ok": token_ok,
+                    "needs_keys": needs_keys,
                     "port": cfg.port,
                     "agents": disc.agents.len(),
                     "keys": disc.keys.values().map(Vec::len).sum::<usize>(),
-                    "workers": workers.len()
+                    "workers": workers.len(),
+                    "readiness": readiness,
                 }))?
             );
             if !ok {
@@ -146,6 +196,11 @@ async fn main() -> Result<()> {
             caller,
             worktree,
             live_api,
+            gate,
+            approve,
+            read_only,
+            spec,
+            sandbox,
         } => {
             let cfg = load_config()?;
             let disc = scan_discovery();
@@ -154,31 +209,35 @@ async fn main() -> Result<()> {
             let _ = build_router(state.clone());
             let run = dispatch_run_async(
                 state.clone(),
-                prompt,
-                caller,
-                worker,
-                "execute".into(),
-                worktree,
-                None,
-                live_api,
-                None,
-                true,
+                DispatchOptions {
+                    prompt,
+                    caller,
+                    worker_id: worker,
+                    phase: "execute".into(),
+                    use_worktree: worktree && !read_only,
+                    simulate_fault: None,
+                    live_api,
+                    fanout_group: None,
+                    allow_keys: true,
+                    allow_paid: approve,
+                    gate_cmd: gate,
+                    read_only,
+                    path_globs: None,
+                    sandbox_tier: sandbox,
+                    spec_id: spec,
+                },
             );
-            // Wait until the spawned dispatch writes a terminal state. A missing row means "not finished yet":
-            // the old check returned immediately, and the CLI exited before the model call completed.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(900);
             while state
                 .store
                 .get_run(&run.id)
-                .map(|r| r.state == lingonberry_core::types::RunState::Running)
+                .map(|r| r.state == RunState::Running || r.state == RunState::Leased)
                 .unwrap_or(true)
                 && std::time::Instant::now() < deadline
             {
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
             }
             let final_run = state.store.get_run(&run.id).unwrap_or(run);
-            // Print copy text on success so `lingonberry-core run` returns the actual output,
-            // not a dispatch receipt JSON. On failure, surface the error.
             match final_run.state {
                 RunState::Done => {
                     if let Some(output) = &final_run.output {
@@ -195,7 +254,8 @@ async fn main() -> Result<()> {
                     std::process::exit(1);
                 }
                 _ => {
-                    println!("{}", serde_json::to_string_pretty(&final_run)?);
+                    eprintln!("run timed out waiting for completion");
+                    std::process::exit(1);
                 }
             }
         }
@@ -203,6 +263,7 @@ async fn main() -> Result<()> {
             prompts,
             caller,
             worktree,
+            approve,
         } => {
             let cfg = load_config()?;
             let disc = scan_discovery();
@@ -215,15 +276,21 @@ async fn main() -> Result<()> {
                 let w_id = workers.get(idx % workers.len().max(1)).map(|w| w.id.clone());
                 let r = dispatch_run_async(
                     state.clone(),
-                    p,
-                    caller.clone(),
-                    w_id,
-                    "fanout".into(),
-                    worktree,
-                    None,
-                    false,
-                    Some(group.clone()),
-                    true,
+                    DispatchOptions {
+                        prompt: p,
+                        caller: caller.clone(),
+                        worker_id: w_id,
+                        phase: "fanout".into(),
+                        use_worktree: worktree,
+                        simulate_fault: None,
+                        live_api: false,
+                        fanout_group: Some(group.clone()),
+                        allow_keys: true,
+                        allow_paid: approve,
+                        gate_cmd: None,
+                        read_only: false,
+                        ..Default::default()
+                    },
                 );
                 ids.push(r.id);
             }
@@ -231,7 +298,7 @@ async fn main() -> Result<()> {
                 state
                     .store
                     .get_run(id)
-                    .map(|r| r.state == lingonberry_core::types::RunState::Running)
+                    .map(|r| r.state == RunState::Running || r.state == RunState::Leased)
                     .unwrap_or(false)
             }) {
                 tokio::time::sleep(std::time::Duration::from_millis(80)).await;
@@ -264,7 +331,6 @@ async fn main() -> Result<()> {
                     continue;
                 };
                 let Some(id) = req.get("id").cloned() else {
-                    // JSON-RPC notifications have no id and must not receive a response
                     continue;
                 };
                 let method = req["method"].as_str().unwrap_or("");
@@ -278,7 +344,7 @@ async fn main() -> Result<()> {
                         "tools": [
                             {
                                 "name": "lingonberry_route",
-                                "description": "Cook raw prompt with global skills/constitution and compute a constraint-checked routing receipt",
+                                "description": "Cook raw prompt with global/mini-harness skills and compute a constraint-checked routing receipt",
                                 "inputSchema": {
                                     "type": "object",
                                     "properties": {
@@ -297,7 +363,7 @@ async fn main() -> Result<()> {
                             },
                             {
                                 "name": "lingonberry_snapshot",
-                                "description": "Return current router snapshot: live workers, keys, host cron jobs, and sessions",
+                                "description": "Return current router snapshot: live workers, keys, host cron jobs, readiness, and sessions",
                                 "inputSchema": { "type": "object", "properties": {} }
                             },
                             {

@@ -40,33 +40,33 @@
   }
 }
 
-/* Theme-aware surface tokens so the UI respects day/night by system. */
+/* Calm architectural neutral canvas + Indigo focus + strictly semantic Green/Red */
 :root {
   --lb-surface: #ffffff;
-  --lb-surface-alt: #f8f9fb;
-  --lb-panel: #f8f9fb;
-  --lb-border: #e2e4e7;
-  --lb-text: #0f172a;
-  --lb-text-muted: #64748b;
-  --lb-text-dim: #94a3b8;
-  --lb-accent: #e5a950;
-  --lb-accent-text: #92400e;
-  --lb-success: #10b981;
-  --lb-danger: #ef4444;
+  --lb-surface-alt: #fafafa;
+  --lb-panel: #f4f4f5;
+  --lb-border: #e4e4e7;
+  --lb-text: #09090b;
+  --lb-text-muted: #52525b;
+  --lb-text-dim: #a1a1aa;
+  --lb-accent: #4f46e5;
+  --lb-accent-text: #4338ca;
+  --lb-success: #059669;
+  --lb-danger: #dc2626;
 }
 
 .dark {
-  --lb-surface: #0b0d12;
-  --lb-surface-alt: #11131b;
-  --lb-panel: #11131b;
-  --lb-border: #23262e;
-  --lb-text: #f1f2f6;
-  --lb-text-muted: #9ba1b4;
-  --lb-text-dim: #646d79;
-  --lb-accent: #fabb60;
-  --lb-accent-text: #fde68a;
+  --lb-surface: #09090b;
+  --lb-surface-alt: #111114;
+  --lb-panel: #18181b;
+  --lb-border: #27272a;
+  --lb-text: #fafafa;
+  --lb-text-muted: #a1a1aa;
+  --lb-text-dim: #71717a;
+  --lb-accent: #6366f1;
+  --lb-accent-text: #a5b4fc;
   --lb-success: #34d399;
-  --lb-danger: #fb7185;
+  --lb-danger: #f87171;
 }
 
 .lb-surface {

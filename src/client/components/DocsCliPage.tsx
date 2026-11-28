@@ -6,39 +6,105 @@ interface DocsCliPageProps {
 }
 
 const CLI_ROWS = [
-  { cmd: 'init [--force]', desc: 'Create ~/.lingonberry, config.json, and plan global self-config (idempotent).' },
-  { cmd: 'doctor', desc: 'Read-only health check outputting JSON; exits 1 on invalid config or missing state.' },
-  { cmd: 'discover', desc: 'Scan PATH for agent CLIs, env key names, providers, workers, and shared skill dirs.' },
-  { cmd: 'route "<prompt>"', desc: 'Cook prompt with matching skill/command/hook and print cryptographic receipt; runs nothing.' },
-  { cmd: 'run "<prompt>" [--worker <id>] [--caller <name>] [--gate <cmd>] [--worktree]', desc: 'Lease a provider-scoped key, execute CLI or API worker, and verify gate.' },
-  { cmd: 'fanout "<p1>" "<p2>" …', desc: 'Dispatch one run per prompt round-robin over discovered workers.' },
-  { cmd: 'serve [127.0.0.1:8799]', desc: 'Start the loopback HTTP API, SQLite WAL store, and background cron watchdog.' },
-  { cmd: 'self-config [--apply]', desc: 'Inspect or apply global-first skill/constitution files plus 2-line light pointers.' },
-  { cmd: 'mcp', desc: 'Run JSON-RPC 2.0 MCP stdio bridge (lingonberry_route, discover, snapshot, self_config).' },
+  {
+    cmd: 'init [--force] [--yes]',
+    desc: 'Create ~/.lingonberry, api.token (0600), mini-harness, and install/configure pi-rust.',
+  },
+  {
+    cmd: 'doctor',
+    desc: 'Read-only check verifying config, token, mini-harness, pi-rust, and worker count.',
+  },
+  {
+    cmd: 'discover',
+    desc: 'Scan PATH for CLIs, Keychain slots, free-tier pools, and shared ~/.agent-skills dirs.',
+  },
+  {
+    cmd: 'route "<prompt>" [--worktree]',
+    desc: 'Run 2-stage complexity + BM25 skill router (<5ms) and print cryptographic receipt.',
+  },
+  {
+    cmd: 'run "<prompt>" [--worker <id>] [--sandbox seatbelt|docker] [--spec <id>] [--gate <cmd>] [--worktree]',
+    desc: 'Lease free-first slot, isolate in Seatbelt/Docker worktree, enforce diff scope, and escalate on gate failure.',
+  },
+  {
+    cmd: 'fanout "<p1>" "<p2>" …',
+    desc: 'Dispatch concurrent worktree waves gated by Watchdog semaphore and PathLeases.',
+  },
+  {
+    cmd: 'serve [127.0.0.1:8799]',
+    desc: 'Start loopback axum API (bearer-authenticated mutating routes), SQLite WAL, and 5s Watchdog ticker.',
+  },
+  {
+    cmd: 'self-config [--apply]',
+    desc: 'Write canonical SKILL.md, MEMORY.md, and MCP config plus 2-line light pointers.',
+  },
+  {
+    cmd: 'mcp',
+    desc: 'Run JSON-RPC 2.0 MCP stdio bridge for day-to-day Claude/Codex chat continuity.',
+  },
 ];
 
 const HTTP_ROWS = [
-  { method: 'GET', path: '/snapshot', desc: 'Running workers, sessions, keys, cron jobs & live OS cron PIDs, overview, CPU/RAM metrics.' },
-  { method: 'GET', path: '/keys', desc: 'Key-slot status including active inflight, cooldown countdown, and RPM cap.' },
-  { method: 'POST', path: '/api/keys/{name}/rpm', desc: 'Live-adjust per-provider RPM ceiling (5..300) by provider or key name.' },
-  { method: 'POST', path: '/keys/{name}/reset', desc: 'Clear active cooldown lock on a key immediately.' },
-  { method: 'POST', path: '/kill/{pid}', desc: 'Send SIGTERM to one live router-owned worker process group; refuses external PIDs.' },
-  { method: 'GET', path: '/api/jobs', desc: 'List crontab, launchd, systemd, schtasks & router jobs plus live OS cron PIDs.' },
-  { method: 'POST', path: '/api/jobs/rescan', desc: 'Rescan host OS schedules and matching live cron child processes.' },
-  { method: 'POST', path: '/api/jobs/kill/{pid}', desc: 'Send SIGTERM to a running host cron child PID.' },
-  { method: 'POST', path: '/api/jobs/{name}/heal', desc: 'Clear crash lock and reset a crashed cron job to supervised scheduling.' },
-  { method: 'POST', path: '/api/jobs/{name}/watchdog', desc: 'Toggle KeepAlive auto-restart policy for a supervised cron job.' },
-  { method: 'GET', path: '/version', desc: 'Binary executable modification timestamp for daemon restart detection.' },
+  {
+    method: 'GET',
+    path: '/api/snapshot',
+    desc: 'Sessions, live workers, KeyPool, Watchdog RAM/disk/burst, Swarm leases, Channels, and Kiro specs.',
+  },
+  {
+    method: 'POST',
+    path: '/api/run',
+    desc: 'Bearer-protected dispatch supporting worktree, sandbox_tier, path_globs, and spec_id locking.',
+  },
+  {
+    method: 'GET/POST',
+    path: '/api/specs',
+    desc: 'List or author 3-artifact Kiro Spec Manifests with allowed_path_globs and SHA-256 digest.',
+  },
+  {
+    method: 'POST',
+    path: '/api/specs/{id}/approve',
+    desc: 'Cryptographically sign and unlock a Kiro spec for overnight or autonomous execution.',
+  },
+  {
+    method: 'POST',
+    path: '/api/specs/{id}/run',
+    desc: 'Verify SHA-256 signature and execute approved spec waves under Seatbelt or Docker.',
+  },
+  {
+    method: 'GET',
+    path: '/api/watchdog',
+    desc: 'Read host memory pressure, APFS free disk GB, dynamic concurrency cap, and 5h burst usage.',
+  },
+  {
+    method: 'GET',
+    path: '/api/swarm',
+    desc: 'Inspect semaphore slots, non-overlapping file-path leases, and serial merge queue.',
+  },
+  {
+    method: 'GET',
+    path: '/api/channels',
+    desc: 'Inspect outbound Telegram/Slack/Discord/MCP bridge status and shared MEMORY.md.',
+  },
+  {
+    method: 'POST',
+    path: '/api/kill/{pid}',
+    desc: 'Bearer-authenticated SIGTERM strictly for router-owned worker process groups.',
+  },
+  {
+    method: 'GET',
+    path: '/api/jobs',
+    desc: 'List read-only host launchd/crontab jobs and managed router schedules.',
+  },
 ];
 
 const CONFIG_KEYS = [
-  { key: 'port', def: '8799', meaning: 'Loopback port for serve when no bind address is passed.' },
-  { key: 'default_worker', def: 'pi', meaning: 'Worker used when a run names none (validated routable).' },
-  { key: 'max_inflight_per_key', def: '3', meaning: 'Concurrent runs allowed per key.' },
-  { key: 'rpm_per_key', def: '40', meaning: 'Calls allowed per key per 60 seconds (live adjustable).' },
-  { key: 'cooldown_s', def: '60', meaning: 'Rest seconds placed after a rate-limit or truncated failure.' },
-  { key: 'lease_wait_s', def: '30', meaning: 'Seconds a dispatch waits for a free key before failing cleanly.' },
-  { key: 'excluded_agents', def: '["cline"]', meaning: 'Discovered agents that stay visible but are never routed to.' },
+  { key: 'port', def: '8799', meaning: 'Loopback port for serve (127.0.0.1 only).' },
+  { key: 'default_worker', def: 'pi', meaning: 'Primary fast execution layer (auto-installed if missing).' },
+  { key: 'sandbox_local_tier', def: 'seatbelt', meaning: 'Default macOS sandbox-exec SBPL isolation for local runs.' },
+  { key: 'sandbox_overnight_tier', def: 'docker', meaning: 'Read-only, cap-dropped container tier for overnight specs.' },
+  { key: 'max_inflight_per_key', def: '3', meaning: 'Concurrent runs allowed per provider key slot.' },
+  { key: 'rpm_per_key', def: '30', meaning: 'Calls allowed per key per 60s (provider_rpm.nim = 40).' },
+  { key: 'subscription_burst_cap', def: '45', meaning: '5-hour escalation cap for paid Claude/Codex subscriptions.' },
 ];
 
 export const DocsCliPage: React.FC<DocsCliPageProps> = ({ onShowToast }) => {
@@ -55,22 +121,19 @@ export const DocsCliPage: React.FC<DocsCliPageProps> = ({ onShowToast }) => {
   };
 
   return (
-    <div className="space-y-8 pb-10">
-      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4">
-        <div>
-          <div className="inline-flex items-center gap-1.5 text-amber-600 dark:text-[#fabb60] text-[11px] font-mono uppercase tracking-wider mb-1 font-semibold">
+    <div className="space-y-10 pb-16">
+      <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 border-b border-zinc-200 dark:border-zinc-800 pb-6">
+        <div className="space-y-1.5">
+          <div className="flex items-center gap-1.5 text-indigo-600 dark:text-indigo-400 text-xs font-mono font-medium">
             <Terminal className="w-3.5 h-3.5" />
-            Single Source of Truth · README.md
+            <span>CLI &amp; Loopback HTTP Reference</span>
           </div>
-          <h1 className="text-2xl sm:text-3xl font-semibold text-zinc-900 dark:text-white tracking-tight">
-            CLI, Loopback HTTP API &amp; Configuration
+          <h1 className="text-2xl sm:text-3xl font-semibold text-zinc-950 dark:text-white tracking-tight">
+            CLI Commands, Auth-Protected API &amp; Config
           </h1>
-          <p className="text-zinc-600 dark:text-[#9ba1b4] text-[13px] mt-1 max-w-2xl">
-            Every command, config key, and HTTP endpoint exposed by{' '}
-            <code className="font-mono text-xs">lingonberry-core</code>. State lives in{' '}
-            <code className="font-mono text-xs">~/.lingonberry</code>; API keys stay in{' '}
-            <code className="font-mono text-xs">~/.env</code> or{' '}
-            <code className="font-mono text-xs">~/.config/lingonberry/env</code>.
+          <p className="text-zinc-600 dark:text-zinc-400 text-[13.5px] max-w-xl">
+            Mutating routes require <code className="font-mono text-xs">~/.lingonberry/api.token</code>.
+            Keys live encrypted in macOS Keychain.
           </p>
         </div>
 
@@ -79,62 +142,35 @@ export const DocsCliPage: React.FC<DocsCliPageProps> = ({ onShowToast }) => {
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
           placeholder="Filter CLI or endpoints…"
-          className="h-9 w-full md:w-64 px-3 rounded-xl border border-zinc-200 dark:border-white/[0.08] bg-white dark:bg-[#11131b] text-xs font-mono text-zinc-800 dark:text-slate-200 placeholder:text-zinc-400 focus:outline-none focus:border-amber-500/60"
+          className="h-9 w-full md:w-64 px-3 rounded-lg border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-[#111114] text-xs font-mono text-zinc-950 dark:text-zinc-100 placeholder:text-zinc-400 focus:outline-none focus:border-indigo-500"
         />
       </div>
 
-      {/* Why Comparison Table */}
-      <section className="rounded-2xl overflow-hidden bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08]">
-        <div className="px-4 py-3 border-b border-zinc-200 dark:border-white/[0.06] font-mono text-[11px] font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-300">
-          Why Lingonberry Router
-        </div>
-        <div className="grid grid-cols-1 md:grid-cols-2 divide-y md:divide-y-0 md:divide-x divide-zinc-200 dark:divide-white/[0.06] text-[12.5px]">
-          <div className="p-4 space-y-2.5 text-zinc-600 dark:text-zinc-400">
-            <div className="font-mono text-[10.5px] uppercase tracking-wider text-zinc-500">
-              Without Lingonberry
-            </div>
-            <p>• Each agent manages its own API keys and copies prompts blindly.</p>
-            <p>• Updating routing rules across 5+ CLI agents takes repetitive manual edits.</p>
-            <p>• Long raw prompts execute without matching global skills or pre-apply hooks.</p>
-            <p>• Runaway agents burn shared quotas and stuck cron PIDs stay invisible.</p>
-          </div>
-          <div className="p-4 space-y-2.5 text-zinc-800 dark:text-zinc-200">
-            <div className="font-mono text-[10.5px] uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
-              With Lingonberry Router
-            </div>
-            <p>• Keys stay in ~/.env; the router leases provider-scoped slot names only.</p>
-            <p>• Global-first self-config writes one skill + constitution and light 2-line pointers.</p>
-            <p>• Raw prompts are cooked with skills, commands, hooks, and repo retrieval first.</p>
-            <p>• Menu bar &amp; tray track live PIDs, Kill controls, RPM caps, and host cron watchdogs.</p>
-          </div>
-        </div>
-      </section>
-
       {/* CLI Table */}
-      <section className="rounded-2xl overflow-hidden bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08]">
-        <div className="px-4 py-3 border-b border-zinc-200 dark:border-white/[0.06] flex items-center justify-between">
-          <span className="font-mono text-[11px] font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-300">
-            CLI Commands (`lingonberry-core`)
+      <section className="rounded-xl overflow-hidden bg-white dark:bg-[#111114] border border-zinc-200 dark:border-zinc-800">
+        <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between font-mono text-[11px]">
+          <span className="font-semibold text-zinc-800 dark:text-zinc-200">
+            CLI Commands (lingonberry-core)
           </span>
-          <span className="font-mono text-[10.5px] text-zinc-400">ROUTER_CALLER overrides caller</span>
+          <span className="text-zinc-500 dark:text-zinc-400">ROUTER_CALLER overrides caller</span>
         </div>
-        <div className="divide-y divide-zinc-200/80 dark:divide-white/[0.04]">
+        <div className="divide-y divide-zinc-200 dark:divide-zinc-800">
           {CLI_ROWS.filter(
             (r) => !q || r.cmd.toLowerCase().includes(q) || r.desc.toLowerCase().includes(q)
           ).map((r) => (
             <div
               key={r.cmd}
-              className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-zinc-50 dark:hover:bg-white/[0.02]"
+              className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-zinc-50 dark:hover:bg-zinc-900/40"
             >
               <button
                 type="button"
                 onClick={() => void copyCmd(`lingonberry-core ${r.cmd}`)}
-                className="inline-flex items-center gap-1.5 text-left font-mono text-[11.5px] font-medium text-amber-700 dark:text-[#fabb60] hover:underline"
+                className="inline-flex items-center gap-1.5 text-left font-mono text-[11.5px] font-medium text-indigo-600 dark:text-indigo-400 hover:underline"
               >
                 <span>lingonberry-core {r.cmd}</span>
                 <Copy className="w-3 h-3 opacity-60 shrink-0" />
               </button>
-              <span className="text-[12px] text-zinc-600 dark:text-zinc-400 sm:text-right max-w-xl">
+              <span className="text-xs text-zinc-600 dark:text-zinc-400 sm:text-right max-w-xl">
                 {r.desc}
               </span>
             </div>
@@ -143,36 +179,36 @@ export const DocsCliPage: React.FC<DocsCliPageProps> = ({ onShowToast }) => {
       </section>
 
       {/* HTTP API Table */}
-      <section className="rounded-2xl overflow-hidden bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08]">
-        <div className="px-4 py-3 border-b border-zinc-200 dark:border-white/[0.06] flex items-center justify-between">
-          <span className="font-mono text-[11px] font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-300">
-            Loopback HTTP API (`127.0.0.1:8799`)
+      <section className="rounded-xl overflow-hidden bg-white dark:bg-[#111114] border border-zinc-200 dark:border-zinc-800">
+        <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 flex items-center justify-between font-mono text-[11px]">
+          <span className="font-semibold text-zinc-800 dark:text-zinc-200">
+            Loopback HTTP API (127.0.0.1:8799)
           </span>
-          <span className="font-mono text-[10.5px] text-emerald-600 dark:text-emerald-400">
-            loopback only
+          <span className="text-emerald-600 dark:text-emerald-400">
+            Bearer token enforced on POST
           </span>
         </div>
-        <div className="divide-y divide-zinc-200/80 dark:divide-white/[0.04]">
+        <div className="divide-y divide-zinc-200 dark:divide-zinc-800">
           {HTTP_ROWS.filter(
             (r) => !q || r.path.toLowerCase().includes(q) || r.desc.toLowerCase().includes(q)
           ).map((r) => (
             <div
               key={`${r.method}-${r.path}`}
-              className="px-4 py-3 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-zinc-50 dark:hover:bg-white/[0.02]"
+              className="px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 hover:bg-zinc-50 dark:hover:bg-zinc-900/40"
             >
               <div className="flex items-center gap-2 font-mono text-[11.5px]">
                 <span
-                  className={`px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                    r.method === 'GET'
-                      ? 'bg-emerald-500/12 text-emerald-700 dark:text-emerald-400'
-                      : 'bg-amber-500/12 text-amber-700 dark:text-[#fabb60]'
-                  }`}
+                  className={
+                    r.method.startsWith('GET')
+                      ? 'text-emerald-700 dark:text-emerald-400 font-semibold'
+                      : 'text-indigo-600 dark:text-indigo-400 font-semibold'
+                  }
                 >
                   {r.method}
                 </span>
-                <span className="text-zinc-900 dark:text-zinc-200">{r.path}</span>
+                <span className="text-zinc-950 dark:text-zinc-200">{r.path}</span>
               </div>
-              <span className="text-[12px] text-zinc-600 dark:text-zinc-400 sm:text-right max-w-xl">
+              <span className="text-xs text-zinc-600 dark:text-zinc-400 sm:text-right max-w-xl">
                 {r.desc}
               </span>
             </div>
@@ -181,25 +217,29 @@ export const DocsCliPage: React.FC<DocsCliPageProps> = ({ onShowToast }) => {
       </section>
 
       {/* Config Keys */}
-      <section className="rounded-2xl overflow-hidden bg-white dark:bg-[#11131b] border border-zinc-200 dark:border-white/[0.08]">
-        <div className="px-4 py-3 border-b border-zinc-200 dark:border-white/[0.06] font-mono text-[11px] font-semibold uppercase tracking-wider text-zinc-600 dark:text-zinc-300">
-          Config Keys (`~/.lingonberry/config.json`)
+      <section className="rounded-xl overflow-hidden bg-white dark:bg-[#111114] border border-zinc-200 dark:border-zinc-800">
+        <div className="px-5 py-3.5 border-b border-zinc-200 dark:border-zinc-800 font-mono text-[11px] font-semibold text-zinc-800 dark:text-zinc-200">
+          Config Keys (~/.lingonberry/config.json)
         </div>
         <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse text-[12px]">
+          <table className="w-full text-left border-collapse text-xs">
             <thead>
-              <tr className="bg-[#f8f9fb] dark:bg-[#06070a]/80 border-b border-zinc-200 dark:border-white/[0.06] font-mono text-[10px] uppercase text-zinc-500">
-                <th className="py-2.5 px-4">Key</th>
-                <th className="py-2.5 px-4">Default</th>
-                <th className="py-2.5 px-4">Meaning</th>
+              <tr className="bg-zinc-50 dark:bg-[#18181B]/70 border-b border-zinc-200 dark:border-zinc-800 font-mono text-[10.5px] text-zinc-500 dark:text-zinc-400">
+                <th className="py-3 px-5 font-medium">Key</th>
+                <th className="py-3 px-4 font-medium">Default</th>
+                <th className="py-3 px-5 font-medium">Meaning</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-zinc-200/80 dark:divide-white/[0.04]">
+            <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
               {CONFIG_KEYS.map((c) => (
                 <tr key={c.key}>
-                  <td className="py-2.5 px-4 font-mono text-zinc-900 dark:text-zinc-200">{c.key}</td>
-                  <td className="py-2.5 px-4 font-mono text-amber-600 dark:text-[#fabb60]">{c.def}</td>
-                  <td className="py-2.5 px-4 text-zinc-600 dark:text-zinc-400">{c.meaning}</td>
+                  <td className="py-3 px-5 font-mono text-zinc-950 dark:text-zinc-200">
+                    {c.key}
+                  </td>
+                  <td className="py-3 px-4 font-mono text-indigo-600 dark:text-indigo-400">
+                    {c.def}
+                  </td>
+                  <td className="py-3 px-5 text-zinc-600 dark:text-zinc-400">{c.meaning}</td>
                 </tr>
               ))}
             </tbody>

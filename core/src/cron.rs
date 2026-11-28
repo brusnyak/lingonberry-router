@@ -6,7 +6,8 @@ use std::process::Command;
 use sysinfo::{Pid, Signal, System};
 
 /// Scans the host OS for all scheduled cron / launchd / systemd / schtasks jobs
-/// so the operator can see everything scheduled across the machine in one place.
+/// strictly READ-ONLY so the operator sees machine-wide schedules without Lingonberry
+/// hijacking or auto-executing external services.
 pub fn scan_os_cron_jobs() -> Vec<JobRow> {
     let mut found = Vec::new();
 
@@ -83,7 +84,16 @@ pub fn parse_crontab_text(text: &str) -> Vec<JobRow> {
     let mut idx = 0usize;
     for raw in text.lines() {
         let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') || line.contains('=') && !line.starts_with('@') && !line.chars().next().map(|c| c.is_ascii_digit() || c == '*').unwrap_or(false) {
+        if line.is_empty()
+            || line.starts_with('#')
+            || (line.contains('=')
+                && !line.starts_with('@')
+                && !line
+                    .chars()
+                    .next()
+                    .map(|c| c.is_ascii_digit() || c == '*')
+                    .unwrap_or(false))
+        {
             continue;
         }
         let (schedule, command) = if let Some(rest) = line.strip_prefix('@') {
@@ -110,21 +120,23 @@ pub fn parse_crontab_text(text: &str) -> Vec<JobRow> {
         jobs.push(JobRow {
             name: format!("crontab-{cmd_tail}-{idx}"),
             source: "crontab".into(),
+            scope: "discovered".into(),
+            read_only: true,
             schedule,
             command: command.clone(),
             every_s: None,
             last: None,
-            rc: Some(0),
+            rc: None,
             paused: Some(false),
-            next_in_s: Some(300),
-            prompt: Some(command),
-            health: "healthy".into(),
+            next_in_s: None, // Owned by OS cron; never triggered by Lingonberry ticker
+            prompt: None,
+            health: "discovered".into(),
             running_pid: None,
             crash_count: 0,
             restart_count: 0,
-            auto_restart: true,
+            auto_restart: false,
             last_error: None,
-            log_tail: vec!["Discovered from user crontab".into()],
+            log_tail: vec!["Host crontab entry (read-only monitor)".into()],
         });
     }
     jobs
@@ -141,28 +153,35 @@ pub fn parse_launchd_plist(xml: &str, path: &PathBuf) -> Option<JobRow> {
     let disabled = xml.contains("<key>Disabled</key>\n\t<true/>")
         || xml.contains("<key>Disabled</key><true/>");
     let command = extract_plist_string(xml, "Program")
+        .or_else(|| extract_plist_program_args(xml))
         .unwrap_or_else(|| format!("launchctl job {label}"));
 
     Some(JobRow {
         name: label,
         source: "launchd".into(),
+        scope: "discovered".into(),
+        read_only: true,
         schedule: interval
-            .map(|s| format!("every {s}s"))
-            .unwrap_or_else(|| "calendar / launchd".into()),
-        command: command.clone(),
+            .map(|s| format!("every {s}s (launchd)"))
+            .unwrap_or_else(|| "launchd calendar".into()),
+        command,
         every_s: interval,
         last: None,
-        rc: Some(0),
+        rc: None,
         paused: Some(disabled),
-        next_in_s: if disabled { None } else { interval },
-        prompt: Some(command),
-        health: if disabled { "paused" } else { "healthy" }.into(),
+        next_in_s: None, // Owned by macOS launchd; never dispatched by Lingonberry ticker
+        prompt: None,
+        health: if disabled {
+            "paused".into()
+        } else {
+            "discovered".into()
+        },
         running_pid: None,
         crash_count: 0,
         restart_count: 0,
         auto_restart: keep_alive,
         last_error: None,
-        log_tail: vec![format!("Discovered LaunchAgent: {}", path.display())],
+        log_tail: vec![format!("Read-only LaunchAgent: {}", path.display())],
     })
 }
 
@@ -183,21 +202,23 @@ pub fn parse_systemd_timer(unit: &str, path: &PathBuf) -> Option<JobRow> {
     Some(JobRow {
         name: name.clone(),
         source: "systemd".into(),
+        scope: "discovered".into(),
+        read_only: true,
         schedule,
         command: format!("systemctl --user start {name}.service"),
         every_s: None,
         last: None,
-        rc: Some(0),
+        rc: None,
         paused: Some(false),
-        next_in_s: Some(300),
-        prompt: Some(format!("systemd user unit {name}")),
-        health: "healthy".into(),
+        next_in_s: None,
+        prompt: None,
+        health: "discovered".into(),
         running_pid: None,
         crash_count: 0,
         restart_count: 0,
-        auto_restart: true,
+        auto_restart: false,
         last_error: None,
-        log_tail: vec![format!("Discovered systemd timer: {}", path.display())],
+        log_tail: vec![format!("Read-only systemd timer: {}", path.display())],
     })
 }
 
@@ -213,28 +234,30 @@ fn parse_windows_schtasks(csv: &str) -> Vec<JobRow> {
             out.push(JobRow {
                 name: name.clone(),
                 source: "schtasks".into(),
+                scope: "discovered".into(),
+                read_only: true,
                 schedule: cols.get(1).copied().unwrap_or("scheduled").into(),
                 command: format!("schtasks /Run /TN \"{name}\""),
                 every_s: None,
                 last: None,
-                rc: Some(0),
+                rc: None,
                 paused: Some(paused),
                 next_in_s: None,
-                prompt: Some(name),
+                prompt: None,
                 health: if status.contains("running") {
                     "running"
                 } else if paused {
                     "paused"
                 } else {
-                    "healthy"
+                    "discovered"
                 }
                 .into(),
                 running_pid: None,
                 crash_count: 0,
                 restart_count: 0,
-                auto_restart: true,
+                auto_restart: false,
                 last_error: None,
-                log_tail: vec!["Discovered via Windows Task Scheduler".into()],
+                log_tail: vec!["Read-only Windows Task Scheduler entry".into()],
             });
         }
     }
@@ -249,6 +272,33 @@ fn extract_plist_string(xml: &str, key: &str) -> Option<String> {
     let after = &rest[start + 8..];
     let end = after.find("</string>")?;
     Some(after[..end].trim().to_string())
+}
+
+fn extract_plist_program_args(xml: &str) -> Option<String> {
+    let needle = "<key>ProgramArguments</key>";
+    let idx = xml.find(needle)?;
+    let rest = &xml[idx + needle.len()..];
+    let arr_start = rest.find("<array>")?;
+    let arr_end = rest[arr_start..].find("</array>")?;
+    let block = &rest[arr_start..arr_start + arr_end];
+    let mut parts = Vec::new();
+    let mut cursor = block;
+    while let Some(s) = cursor.find("<string>") {
+        let after = &cursor[s + 8..];
+        let Some(e) = after.find("</string>") else {
+            break;
+        };
+        parts.push(after[..e].trim().to_string());
+        cursor = &after[e + 9..];
+        if parts.len() >= 4 {
+            break;
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(" "))
+    }
 }
 
 fn extract_plist_int(xml: &str, key: &str) -> Option<u64> {
@@ -284,10 +334,7 @@ pub fn scan_live_cron_processes(jobs: &BTreeMap<String, JobRow>) -> Vec<LiveCron
         if cmd_line.is_empty() && proc_name.is_empty() {
             continue;
         }
-        if proc_name == "curl"
-            || proc_name == "ps"
-            || cmd_line.contains("/api/jobs/")
-        {
+        if proc_name == "curl" || proc_name == "ps" || cmd_line.contains("/api/jobs/") {
             continue;
         }
 
@@ -295,6 +342,8 @@ pub fn scan_live_cron_processes(jobs: &BTreeMap<String, JobRow>) -> Vec<LiveCron
             let needle = job.command.split_whitespace().next().unwrap_or("");
             let matches_cmd = needle.len() > 3
                 && !needle.starts_with("lingonberry-core")
+                && needle != "launchctl"
+                && needle != "systemctl"
                 && cmd_line.contains(needle);
             let matches_name = job.name.len() > 4
                 && proc_name != "sh"
@@ -322,7 +371,12 @@ pub fn scan_live_cron_processes(jobs: &BTreeMap<String, JobRow>) -> Vec<LiveCron
     live
 }
 
-/// Runs an external OS cron command (non-lingonberry-core) with stdin closed and captures exit code + log tail.
+pub fn is_os_pid_alive(pid: u32) -> bool {
+    let mut sys = System::new_all();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+    sys.process(Pid::from_u32(pid)).is_some()
+}
+
 pub fn execute_os_cron_command(command: &str) -> (i32, Vec<String>) {
     #[cfg(windows)]
     let out = Command::new("cmd")
@@ -360,7 +414,7 @@ pub fn execute_os_cron_command(command: &str) -> (i32, Vec<String>) {
 
 pub fn kill_os_pid(pid: u32) -> bool {
     let mut sys = System::new_all();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
     if let Some(p) = sys.process(Pid::from_u32(pid)) {
         return p.kill_with(Signal::Term).unwrap_or_else(|| p.kill());
     }
@@ -372,7 +426,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_crontab_schedules_and_ignores_comments() {
+    fn parses_crontab_schedules_as_read_only_discovered() {
         let sample = r#"
 # m h dom mon dow command
 MAILTO=""
@@ -383,22 +437,33 @@ MAILTO=""
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].schedule, "0 */4 * * *");
         assert_eq!(parsed[0].source, "crontab");
+        assert_eq!(parsed[0].scope, "discovered");
+        assert!(parsed[0].read_only);
+        assert_eq!(parsed[0].next_in_s, None);
+        assert_eq!(parsed[0].rc, None);
         assert_eq!(parsed[1].schedule, "@daily");
     }
 
     #[test]
-    fn parses_macos_launchd_plist_keepalive_and_interval() {
+    fn parses_macos_launchd_plist_program_arguments_and_read_only() {
         let plist = r#"
 <plist version="1.0"><dict>
-  <key>Label</key><string>com.lingonberry.audit</string>
-  <key>Program</key><string>/usr/local/bin/lingonberry-core</string>
+  <key>Label</key><string>com.example.sync</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/local/bin/sync-tool</string>
+    <string>--quiet</string>
+  </array>
   <key>StartInterval</key><integer>900</integer>
   <key>KeepAlive</key><true/>
 </dict></plist>
 "#;
-        let job = parse_launchd_plist(plist, &PathBuf::from("/tmp/audit.plist")).unwrap();
-        assert_eq!(job.name, "com.lingonberry.audit");
-        assert_eq!(job.every_s, Some(900));
+        let job = parse_launchd_plist(plist, &PathBuf::from("/tmp/sync.plist")).unwrap();
+        assert_eq!(job.name, "com.example.sync");
+        assert_eq!(job.scope, "discovered");
+        assert!(job.read_only);
+        assert_eq!(job.command, "/usr/local/bin/sync-tool --quiet");
+        assert_eq!(job.next_in_s, None);
         assert!(job.auto_restart);
     }
 }

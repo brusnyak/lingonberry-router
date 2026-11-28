@@ -1,125 +1,64 @@
-# Lingonberry Router — Handoff for Next Session
+# Lingonberry Router — Current Architecture & Handoff
 
-## Current State (as of 2026-11-27)
-
-### Deployed at `/Applications/Lingonberry Router.app/`
-- `Contents/MacOS/lingonberry-tray` — SwiftUI menu bar app (auto-starts core on launch)
-- `Contents/MacOS/lingonberry-core` — Rust backend HTTP server (bundled inside app)
-- `Contents/Resources/icon.icns` — New tree icon (branching nodes + red fruit + green leaves)
-- App is **codesigned** (ad-hoc)
-
-### How to use
-Just double-click `/Applications/Lingonberry Router.app`. No terminal needed.
-The app auto-launches `lingonberry-core serve` in the background, then opens the menu bar popover anchored under the icon.
-
-### Verified working
-- Core: `cargo build --release` clean, `cargo test --release` 31 passed
-- UI: `swift build -c release` clean
-- App opens → core auto-starts → `/api/snapshot` returns data (8 workers, 38 jobs, 60 sessions, 105 completed 24h)
-- Real NIM provider calls work (genuine output, not stubs)
-- Key rotation works (NIM_1 → NIM_2, not pinned to one key)
-- Failover works (bad Groq model → escalates cleanly)
+## Scope & Canonical Stack (Mac-First)
+- **Canonical Runtime**:
+  - `core/` — Rust backend (`axum` loopback server on `127.0.0.1:8799`, SQLite WAL, macOS Keychain secret storage, `pi-rust` OpenAI proxy at `/v1/chat/completions`, real `git worktree` isolation, verification gates, Overnight ticket queue).
+  - `ui/macos-swift/` — Native macOS SwiftUI `MenuBarExtra` (`LingonberryBar`), built with zero Swift macros and zero external SwiftPM dependencies.
+- **Deferred / Non-Canonical**: `src/` (web dashboard), `tray/` (Tauri), `ui/linux/`, and `ui/windows/` are deferred to post-Mac phases and are not modified in this pass.
 
 ---
 
-## Issues Fixed in This Session
+## Security & Reliability Hardening Implemented
 
-### 1. Data not showing — "The data couldn't be read because it is missing"
-**Root cause:** `Thread.sleep(forTimeInterval: 0.5)` blocked the **main thread** in `ensureCoreRunning()`. `URLSession.shared.dataTask` callbacks are delivered on the main run loop, so while sleeping, callbacks couldn't fire. `coreIsRunning()` always returned false, core appeared down, and `refresh()` failed.
+1. **Loopback Bearer Auth & Origin Guard (`core/src/config.rs`, `core/src/server.rs`, `ui/macos-swift/Sources/LingonberryBar/RouterClient.swift`)**
+   - `ensure_api_token()` creates a 256-bit per-user token at `~/.lingonberry/api.token` (`0600`).
+   - All `POST`/`PUT`/`DELETE` routes and `/v1/chat/completions` require `Authorization: Bearer <token>` (constant-time comparison) plus loopback `Host` and non-browser `Origin` checks.
+   - `POST /api/jobs/kill/:pid` is `403 Forbidden` unless the PID belongs to an active Lingonberry child run or a Lingonberry-managed job.
 
-**Fix:** Removed the blocking `Thread.sleep` wait loop. `ensureCoreRunning()` now just launches core non-blockingly. The 3-second refresh timer (`store.start()`) plus `refresh()`'s internal 2-second retry handle the wait until core is up.
+2. **Read-Only Host Cron Monitoring (`core/src/cron.rs`, `core/src/storage.rs`, `core/src/server.rs`)**
+   - Discovered host jobs (`launchd`, `crontab`, `systemd`, `schtasks`) are marked `scope = "discovered"` and `read_only = true`.
+   - The 5-second ticker and `POST /api/jobs/:name/run` strictly skip discovered jobs — they are never dispatched as LLM calls or external shells.
+   - Seeded fake `launchd` mock entries were removed; only the local `doctor-health-sweep` watchdog is seeded (`managed`).
 
-**Files changed:** `ui/macos-swift/Sources/LingonberryBar/main.swift`
+3. **`pi-rust` Execution Layer & Zero-Key-Leak Proxy (`core/src/discovery.rs`, `core/src/keychain.rs`, `core/src/server.rs`)**
+   - Raw provider API keys stay in macOS Keychain (`service = "lingonberry-router"`, slots `kc:<provider>:<label>`) or user `.env` files — never written to `~/.pi/agent/auth.json`, snapshots, or SQLite.
+   - `configure_pi_rust()` points `pi` at `http://127.0.0.1:8799/v1` using only the local session token; `POST /v1/chat/completions` leases keys inside the provider boundary and enforces paid-tier approval.
+   - Readiness modes (`full`, `mini_harness`, `bare_minimum`) and one-click `POST /api/install/pi` allow clean onboarding with zero external harness prerequisites (`~/.lingonberry/harness/skills`).
 
-### 2. Menu bar popover not anchored under icon
-**Root cause:** `.menuBarExtraStyle(.window)` had been removed, causing default floating-window behavior on this macOS version.
+4. **Real Isolation, Gates & Cost Tiers (`core/src/harness.rs`, `core/src/agents.rs`, `core/src/server.rs`)**
+   - `--worktree` creates an actual isolated `git worktree` under `~/.lingonberry/worktrees/<run_id>` (removed on completion).
+   - `--gate` executes real verification (`test`, `build`, `gitleaks`, `git-clean`, or custom command); `gate_passed = true` is set only when a real gate ran and exited `0` (otherwise `gate_status = "not_run"` or `"failed"`).
+   - `--read-only` prevents write-capable execution and worktree mutations.
+   - `--approve` is required before routing to `metered_paid` providers when `paid_keys_require_approval` is `true` (default).
+   - CLI runs enforce `cli_timeout_s` (default `180s`), capture up to 2000 chars of secret-redacted stderr, pass `-C <cwd> --skip-git-repo-check` to `codex exec`, and check `is_os_pid_alive(os_pid)` before marking orphan runs.
 
-**Fix:** Restored `.menuBarExtraStyle(.window)` which anchors the popover under the menu bar icon.
+5. **Overnight Proposal Queue (`core/src/storage.rs`, `core/src/server.rs`, `ui/macos-swift/`)**
+   - Scans local git repos and queues `pending_approval` tickets instead of spending keys unattended.
+   - Owner approves (`POST /api/overnight/tickets/:id/approve` -> runs in isolated worktree + `--gate test`) or defers via the menu bar Setup panel or macOS notification actions (when bundled).
 
-**Files changed:** `ui/macos-swift/Sources/LingonberryBar/main.swift`
-
-### 3. Graph design didn't match reference
-**Root cause:** Original graph was too simple — simple circles, single accent color lines, no "Router Dispatch" center badge.
-
-**Fix:** Rewrote `GraphView` to match reference image #1:
-- Dark background with rounded rectangle
-- Center: "Router Dispatch" badge (purple/blue rounded square with network icon)
-- Left: Caller nodes (Claude, Codex, OpenCode) as pill-shaped nodes with icons
-- Right: Provider nodes (OMP/NIM, Pi/Groq, JCode/OpenRouter, OpenCode, Kilo) as pill-shaped nodes with icons
-- Colored curved gradient lines connecting left→center→right (orange, green, blue, purple, pink)
-
-**Files changed:** `ui/macos-swift/Sources/LingonberryBar/Views/PopoverView.swift`
-
----
-
-## What Remains for Next Session
-
-### P0: Verify the app works end-to-end for the user
-1. User double-clicks `/Applications/Lingonberry Router.app`
-2. Core auto-starts (verify via Activity Monitor or `pgrep -fl lingonberry-core`)
-3. Menu bar icon appears
-4. Click the icon → popover opens **under the icon** (not floating in middle of screen)
-5. Green dot shows router is up
-6. Stats strip shows real numbers (Running, Avg, Success %, Tasks 24h)
-7. Graph shows the reference-style layout with colored nodes and curved lines
-8. Three cards show Workers / Providers / Routerjobs with real data
-9. Sessions show last 24h of dispatch with real worker output
-
-### P1: Known issues to investigate
-- **Snapshot dev command hangs:** `LB_SNAPSHOT=...` dev path spawns `ImageRenderer` which blocks on main thread. Dev-only scaffolding, not a product bug. Can be removed or fixed separately.
-- **macOS icon cache:** If the menubar icon looks stale, quit and reopen the app (macOS caches app icons aggressively).
-- **Groq model invalid:** `known_provider` groq = `llama-3.1-8b-instant` returns 404. Failover handles it, but config points at a dead model. Fix `known_provider` in `core/src/discovery.rs` or drop groq from rotation.
-
-### P2: Code cleanup
-- **Commit backend + UI changes** (push needs owner yes):
-  - `core/src/config.rs` — `ExecutionMode {Live, Simulate}`, `execution` field
-  - `core/src/registry.rs` — `provider_headroom()`, `select_best_worker_excluding()`, `LeaseGuard::cancel()`
-  - `core/src/agents.rs` — headroom tiebreak in route scoring
-  - `core/src/server.rs` — `is_owner_request` no-Origin handling, `live_api` gating, failover tracking, stub removal
-  - `ui/macos-swift/Sources/LingonberryBar/main.swift` — non-blocking core launch, `.window` style
-  - `ui/macos-swift/Sources/LingonberryBar/Views/PopoverView.swift` — new graph, error display in header
-  - `ui/macos-swift/Sources/LingonberryBar/RouterStore.swift` — error logging, retry on first failure
-- **Add tests** for `provider_headroom()` and lease failover (31 tests pass but don't cover these paths)
-- **Fix groq model** in `core/src/discovery.rs`
-- **Remove dev scaffolding** from `main.swift` (`LB_SNAPSHOT`, `LB_PREVIEW`, `LB_DARK`, `RenderFlags.noScroll`) or keep gated behind env vars
-
-### P3: Architecture questions for the owner
-- **pi-rust NIMs:** `pi` binary not installed (`which pi` → not found), `~/.pi/agent/auth.json` is `{}`. Backend already supports `pi` workers (leases keys, calls providers directly — no pi-rust binary needed). Install pi binary only if you want it as the executor.
-- **Live vs Simulate default:** `config.execution` defaults to `Live` — cron/fanout/`run_job_now` will spend NIM/google/groq/openrouter keys on real calls. Kill switch: `LINGONBERRY_SIMULATE=1` or `"execution": "simulate"` in `~/.lingonberry/config.json`.
+6. **macOS Menu Bar UX (`ui/macos-swift/Sources/LingonberryBar/`)**
+   - Reactive `@Environment(\.colorScheme)` (`ThemePalette`).
+   - Idle collapses `GraphView` to a compact status strip and hides `WorkersCard`; active dispatches show horizontal `Caller -> Router -> Worker` curves with `.fixedSize()` pills, valid SF Symbols, live `TimelineView` timers, and Stop controls.
+   - `JobsCard` separates `Managed` vs `Host Discovered (Read-Only)`.
+   - Inline 3-tab `SetupPanelView` (`Keys`, `Self-Config & pi`, `Overnight`) avoids `MenuBarExtra` modal dismissal bugs.
 
 ---
 
-## File Structure
+## Config Defaults (`~/.lingonberry/config.json`)
+- `port`: `8799`
+- `execution`: `Live` (override with `LINGONBERRY_SIMULATE=1`)
+- `default_worker`: `pi`
+- `max_inflight_per_key`: `3`
+- `rpm_per_key`: `30` (provider override: `nim: 40`)
+- `cooldown_s`: `60`
+- `lease_wait_s`: `30`
+- `cli_timeout_s`: `180`
+- `paid_keys_require_approval`: `true`
+- `overnight_enabled`: `false`, `overnight_budget_usd`: `0.0`, `overnight_max_runs_per_night`: `5`
+
+## Verification Commands (Run on macOS)
+```sh
+cd core && cargo test --locked
+cd core && cargo build --release --locked
+cd ui/macos-swift && swift build -c release
 ```
-/Users/yegor/Developer/lingonberry-router/
-├── core/
-│   ├── src/
-│   │   ├── config.rs      # ExecutionMode, execution field
-│   │   ├── registry.rs    # provider_headroom, select_best_worker_excluding, LeaseGuard::cancel
-│   │   ├── agents.rs      # headroom tiebreak in route scoring
-│   │   ├── server.rs      # is_owner_request, live_api gating, failover tracking
-│   │   ├── discovery.rs   # provider_for_env, known_provider, build_workers
-│   │   ├── server.rs      # build_snapshot (JSON output)
-│   │   └── types.rs       # Snapshot, SessionRow, JobRow, etc.
-│   └── target/release/lingonberry-core
-├── ui/macos-swift/
-│   ├── Sources/LingonberryBar/
-│   │   ├── main.swift          # MenuBarExtra, ensureCoreRunning, auto-start core
-│   │   ├── RouterStore.swift   # refresh(), snapshot polling, lastError
-│   │   ├── RouterClient.swift  # URLSession client for /api/snapshot
-│   │   ├── Views/PopoverView.swift  # GraphView, HeaderView, ThreeCardsView, SessionsView
-│   │   ├── RouterStore.swift
-│   │   └── Info.plist
-│   └── target/release/lingonberry-tray
-└── HANDOFF.md (this file)
-```
-
-## Config Files
-- `~/.lingonberry/config.json` — port 8799, `execution: Live`, `default_worker: pi`, `max_inflight_per_key: 3`, `rpm_per_key: 30`, `cooldown_s: 60`, `provider_rpm: {nim: 40}`
-- `~/.env` — API keys: `NIM_1`…`NIM_5`, `GOOGLE_STUDIO_API`, `GROQ_API_KEY`, `OPENROUTER_API_KEY`, etc.
-
-## Backend Endpoints
-- `GET http://127.0.0.1:8799/version` — core PID + version
-- `GET http://127.0.0.1:8799/api/snapshot` — full state (workers, jobs, sessions, keys, telemetry)
-- `GET http://127.0.0.1:8799/keys` — key status (inflight, window, cooling)
-- `POST http://127.0.0.1:8799/api/run` — dispatch a run (worker, prompt, live_api)

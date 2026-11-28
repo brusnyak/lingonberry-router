@@ -1,4 +1,7 @@
-use crate::types::{Agent, DiscoveredWorker, DiscoveryData, Provider};
+use crate::config::{ensure_api_token, load_config};
+use crate::harness::{ensure_mini_harness, infer_cost_tier, mini_harness_skills_dir};
+use crate::keychain::{load_keychain_index, resolve_keychain_secret};
+use crate::types::{Agent, DiscoveredWorker, DiscoveryData, KeyCostTier, Provider};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -6,14 +9,12 @@ use std::path::{Path, PathBuf};
 pub const PI_NIM_MODEL: &str = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 
 const AGENT_BINS: &[&str] = &[
-    "claude", "codex", "opencode", "kilo", "cline", "goose", "omp", "hermes",
+    "pi", "pi-rust", "claude", "codex", "opencode", "kilo", "cline", "goose", "omp", "hermes",
     "crush", "qwen",
 ];
 
-/// Env var name -> provider id. Explicit names first, then any `<NAME>_API_KEY` becomes a
-/// provider `<name>` (shown, but dispatched only when a base URL is known). NIM_n and NVIDIA_API_KEY map to nim.
 const WRITE_AGENTS: &[&str] = &[
-    "claude", "codex", "opencode", "kilo", "cline", "goose", "omp",
+    "pi", "pi-rust", "claude", "codex", "opencode", "kilo", "cline", "goose", "omp",
 ];
 
 pub fn provider_for_env(name: &str) -> Option<String> {
@@ -41,6 +42,9 @@ pub fn provider_for_env(name: &str) -> Option<String> {
         ("TOGETHER_API_KEY", "together"),
         ("FIREWORKS_API_KEY", "fireworks"),
         ("CEREBRAS_API_KEY", "cerebras"),
+        ("KILO_API_KEY", "kilo"),
+        ("OPENCODE_API_KEY", "opencode"),
+        ("OLLAMA_API_KEY", "ollama"),
     ];
     if let Some((_, p)) = exact.iter().find(|(k, _)| *k == n) {
         return Some((*p).into());
@@ -52,7 +56,7 @@ pub fn provider_for_env(name: &str) -> Option<String> {
     None
 }
 
-fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
+pub fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Option<&'static str>)> {
     match id {
         "nim" => Some((
             "https://integrate.api.nvidia.com/v1",
@@ -67,7 +71,7 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
         "groq" => Some((
             "https://api.groq.com/openai/v1",
             Some("openai-completions"),
-            Some("qwen/qwen3.8-27b"),
+            Some("llama-3.3-70b-versatile"),
         )),
         "anthropic" => Some((
             "https://api.anthropic.com/v1",
@@ -87,7 +91,11 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
         )),
         "together" => Some(("https://api.together.xyz/v1", Some("openai-completions"), None)),
         "fireworks" => Some(("https://api.fireworks.ai/inference/v1", Some("openai-completions"), None)),
-        "cerebras" => Some(("https://api.cerebras.ai/v1", Some("openai-completions"), None)),
+        "cerebras" => Some((
+            "https://api.cerebras.ai/v1",
+            Some("openai-completions"),
+            Some("llama-3.3-70b"),
+        )),
         "xai" => Some(("https://api.x.ai/v1", Some("openai-completions"), Some("grok-3"))),
         "google" => Some((
             "https://generativelanguage.googleapis.com/v1beta/openai",
@@ -104,6 +112,21 @@ fn known_provider(id: &str) -> Option<(&'static str, Option<&'static str>, Optio
             Some("openai-completions"),
             Some("qwen-plus"),
         )),
+        "ollama" => Some((
+            "http://127.0.0.1:11434/v1",
+            Some("openai-completions"),
+            Some("qwen2.5-coder:7b"),
+        )),
+        "kilo" => Some((
+            "https://api.kilo.ai/api/openrouter/v1",
+            Some("openai-completions"),
+            Some("kilo/free-auto"),
+        )),
+        "opencode" => Some((
+            "https://opencode.ai/zen/v1",
+            Some("openai-completions"),
+            Some("opencode/big-pickle"),
+        )),
         _ => None,
     }
 }
@@ -115,9 +138,12 @@ pub fn env_files(home: &Path) -> Vec<PathBuf> {
     ]
 }
 
-/// Resolves a key value at dispatch time from process env or ~/.env / ~/.config/lingonberry/env.
-/// Key values are NEVER logged or serialized into snapshots.
+/// Resolves a key value at dispatch time from macOS Keychain, process env, ~/.env,
+/// or external read-only agent stores. Key values are NEVER logged or serialized into snapshots.
 pub fn resolve_key_value(slot: &str) -> Option<String> {
+    if slot.starts_with("kc:") {
+        return resolve_keychain_secret(slot);
+    }
     if let Some(rest) = slot.strip_prefix("store:") {
         let (source, name) = rest.split_once('|')?;
         let home = dirs::home_dir()?;
@@ -164,6 +190,13 @@ pub fn redact_secrets(text: &str) -> String {
             out = out.replace(&v, &format!("[REDACTED:{k}]"));
         }
     }
+    for meta in load_keychain_index() {
+        if let Some(secret) = resolve_keychain_secret(&meta.slot) {
+            if secret.len() >= 8 && out.contains(&secret) {
+                out = out.replace(&secret, &format!("[REDACTED:{}]", meta.slot));
+            }
+        }
+    }
     out
 }
 
@@ -171,10 +204,13 @@ pub fn scan_discovery() -> DiscoveryData {
     let mut agents = Vec::new();
     for bin in AGENT_BINS {
         if let Ok(path) = which::which(bin) {
-            agents.push(Agent {
-                id: (*bin).to_string(),
-                path: Some(path.to_string_lossy().into_owned()),
-            });
+            let canonical_id = if *bin == "pi-rust" { "pi" } else { *bin };
+            if !agents.iter().any(|a: &Agent| a.id == canonical_id) {
+                agents.push(Agent {
+                    id: canonical_id.to_string(),
+                    path: Some(path.to_string_lossy().into_owned()),
+                });
+            }
         }
     }
 
@@ -212,13 +248,25 @@ pub fn scan_discovery() -> DiscoveryData {
         }
     }
 
-    // Keys from other agents' stores become dispatchable as `store:<file>|<name>` slots.
-    // Env files are skipped here: the env scan above already covers them.
+    // macOS Keychain-managed slots (non-secret index only)
+    let keychain_slots = load_keychain_index();
+    for kc in &keychain_slots {
+        let list = keys.entry(kc.provider.clone()).or_default();
+        if !list.contains(&kc.slot) {
+            list.push(kc.slot.clone());
+        }
+    }
+
+    // Keys from other agents' stores become dispatchable read-only as `store:<file>|<name>` slots.
     let store_keys = dirs::home_dir()
         .map(|h| crate::stores::scan_stores(&h))
         .unwrap_or_default();
     for sk in &store_keys {
         if sk.source == ".env" || sk.source == ".config/lingonberry/env" {
+            continue;
+        }
+        // Skip our own proxy entries inside ~/.pi/agent/
+        if sk.source.starts_with(".pi/agent/") && sk.name.contains("lingonberry") {
             continue;
         }
         if known_provider(&sk.provider).is_none() {
@@ -237,7 +285,19 @@ pub fn scan_discovery() -> DiscoveryData {
 
     let mut providers = BTreeMap::new();
     for prov in keys.keys() {
-        if let Some((url, style, _)) = known_provider(prov) {
+        if let Some(kc) = keychain_slots
+            .iter()
+            .find(|m| m.provider == *prov && m.base_url.is_some())
+        {
+            providers.insert(
+                prov.clone(),
+                Provider {
+                    id: prov.clone(),
+                    base_url: kc.base_url.clone().unwrap_or_default(),
+                    style: Some("openai-completions".into()),
+                },
+            );
+        } else if let Some((url, style, _)) = known_provider(prov) {
             providers.insert(
                 prov.clone(),
                 Provider {
@@ -259,7 +319,8 @@ pub fn scan_discovery() -> DiscoveryData {
     }
 
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
-    let library_dirs = [
+    let _ = ensure_mini_harness();
+    let mut library_dirs: Vec<String> = [
         home.join(".claude").join("skills"),
         home.join(".agent-skills"),
         home.join(".codex").join("skills"),
@@ -269,6 +330,13 @@ pub fn scan_discovery() -> DiscoveryData {
     .filter(|p| p.exists())
     .map(|p| p.to_string_lossy().into_owned())
     .collect();
+    let mini_dir = mini_harness_skills_dir();
+    if mini_dir.exists() {
+        let s = mini_dir.to_string_lossy().into_owned();
+        if !library_dirs.contains(&s) {
+            library_dirs.push(s);
+        }
+    }
 
     let mut ssh_hosts = Vec::new();
     if let Ok(ssh_cfg) = fs::read_to_string(home.join(".ssh").join("config")) {
@@ -310,6 +378,7 @@ pub fn scan_discovery() -> DiscoveryData {
         git_projects,
         browsers: Vec::new(),
         stores: store_keys,
+        keychain_slots,
     }
 }
 
@@ -342,31 +411,53 @@ pub fn ensure_tool_path() {
 
 pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
     let mut out = Vec::new();
+    let cfg_tiers = load_config().map(|c| c.key_tiers).unwrap_or_default();
 
-    // Pi-rust workers: one per provider, keys managed via ~/.pi/agent/auth.json
-    // (lingonberry-core init populates auth.json; no keys appear in CLI args)
+    // `pi` workers: one per provider with available key slots. Keys stay in Keychain / env
+    // and are injected dynamically via Lingonberry's local proxy or LeaseGuard.
     for (prov, keys) in &d.keys {
         if keys.is_empty() {
             continue;
         }
-        let default_model = known_provider(prov).and_then(|(_, _, m)| m.map(str::to_string));
+        let custom_model = d
+            .keychain_slots
+            .iter()
+            .find(|m| m.provider == *prov && m.model.is_some())
+            .and_then(|m| m.model.clone());
+        let default_model =
+            custom_model.or_else(|| known_provider(prov).and_then(|(_, _, m)| m.map(str::to_string)));
         let pi_agent = d.agents.iter().find(|a| a.id == "pi");
+        let tier = cfg_tiers
+            .get(prov)
+            .map(|s| KeyCostTier::from_str(s))
+            .or_else(|| {
+                d.keychain_slots
+                    .iter()
+                    .find(|m| m.provider == *prov)
+                    .map(|m| KeyCostTier::from_str(&m.cost_tier))
+            })
+            .unwrap_or_else(|| infer_cost_tier(prov, None));
         out.push(DiscoveredWorker {
             id: format!("pi:{prov}"),
             agent: "pi".to_string(),
             key_name: None,
             provider: prov.clone(),
-            base_url: d.providers.get(prov).map(|p| p.base_url.clone()).filter(|u| !u.is_empty()),
-            model: default_model.clone(),
+            base_url: d
+                .providers
+                .get(prov)
+                .map(|p| p.base_url.clone())
+                .filter(|u| !u.is_empty()),
+            model: default_model,
             write_access: true,
             path: pi_agent.and_then(|a| a.path.clone()),
+            cost_tier: tier,
         });
     }
 
-    // CLI agent workers (each uses their own credentials, not lingonberry key pool)
+    // CLI agent workers (each uses its own local login/OAuth, never Lingonberry owner keys)
     for agent in &d.agents {
         if agent.id == "pi" || agent.id == "nim-chat" {
-            continue; // pi handled above; nim-chat was a standalone key worker, removed
+            continue;
         }
         out.push(DiscoveredWorker {
             id: agent.id.clone(),
@@ -377,98 +468,131 @@ pub fn build_workers(d: &DiscoveryData) -> Vec<DiscoveredWorker> {
             model: None,
             write_access: WRITE_AGENTS.contains(&agent.id.as_str()),
             path: agent.path.clone(),
+            cost_tier: KeyCostTier::Local,
         });
     }
 
     out
 }
 
-/// Configure pi-rust credentials from discovered keys.
-/// Writes ~/.pi/agent/auth.json and ~/.pi/agent/models.json so that
-/// lingonberry-core owns the key store and pi-rust reads from it.
-/// No keys appear in CLI arguments — pi-rust reads them from its config files.
+/// Configures `pi-rust` safely: instead of writing raw provider API keys into `~/.pi/agent/auth.json`
+/// and `models.json`, points `pi-rust` at Lingonberry's authenticated local loopback proxy
+/// (`http://127.0.0.1:{port}/v1`) using the ephemeral `0600` local bearer token, and keeps
+/// provider IDs consistent (`nim`, `groq`, `google`, `openrouter`, etc.).
 pub fn configure_pi_rust(home: &Path, disc: &DiscoveryData) -> Result<(), Box<dyn std::error::Error>> {
     let pi_agent_dir = home.join(".pi").join("agent");
     std::fs::create_dir_all(&pi_agent_dir)?;
 
-    // Build auth.json: provider -> { type: "api_key", key: <value> }
+    let cfg = load_config().unwrap_or_default();
+    let local_token = ensure_api_token()?;
+    let proxy_base = format!("http://127.0.0.1:{}/v1", cfg.port);
+
     let mut auth: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+    let mut providers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
     for (prov, keys) in &disc.keys {
         if keys.is_empty() {
             continue;
         }
-        let key_name = keys.first().cloned().unwrap_or_default();
-        let key_val = resolve_key_value(&key_name).unwrap_or_default();
-        if key_val.is_empty() {
+        let default_model = disc
+            .keychain_slots
+            .iter()
+            .find(|m| m.provider == *prov && m.model.is_some())
+            .and_then(|m| m.model.clone())
+            .or_else(|| known_provider(prov).and_then(|(_, _, m)| m.map(str::to_string)));
+        let Some(model_id) = default_model else {
             continue;
-        }
-        let provider_name = match prov.as_str() {
-            "nim" => "nvidia",
-            p => p,
         };
+
         auth.insert(
-            provider_name.to_string(),
+            prov.clone(),
             serde_json::json!({
                 "type": "api_key",
-                "key": key_val,
+                "key": local_token,
             }),
         );
-    }
-    let auth_json = serde_json::to_string_pretty(&serde_json::Value::Object(auth))?;
-    std::fs::write(pi_agent_dir.join("auth.json"), auth_json)?;
-
-    // Build models.json: provider blocks with baseUrl, api, apiKey, models
-    let mut providers: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-    for (prov, keys) in &disc.keys {
-        if keys.is_empty() {
-            continue;
-        }
-        let (base_url, api_style, default_model) = known_provider(prov)
-            .map(|(url, style, model)| (url.to_string(), style.map(|s| s.to_string()), model.map(|m| m.to_string())))
-            .unwrap_or_else(|| (String::new(), None, None));
-        if base_url.is_empty() {
-            continue;
-        }
-        let provider_name = match prov.as_str() {
-            "nim" => "nvidia",
-            p => p,
-        };
-        let models: Vec<serde_json::Value> = default_model
-            .iter()
-            .map(|m| {
-                serde_json::json!({
-                    "id": m,
-                    "name": m,
-                })
-            })
-            .collect();
-        let key_name = match prov.as_str() {
-            "nim" => "NIM_1",
-            "groq" => "GROQ_API_KEY",
-            "google" => "GOOGLE_STUDIO_API",
-            "openrouter" => "OPENROUTER_API_KEY",
-            p => &format!("{}_API_KEY", p.to_uppercase()),
-        };
-        let key_val = resolve_key_value(key_name).unwrap_or_default();
-        if key_val.is_empty() {
-            continue;
-        }
         providers.insert(
-            provider_name.to_string(),
+            prov.clone(),
             serde_json::json!({
-                "baseUrl": base_url,
-                "api": api_style.unwrap_or_else(|| "openai-completions".to_string()),
-                "apiKey": key_val,
-                "models": models,
+                "baseUrl": proxy_base,
+                "api": "openai-completions",
+                "apiKey": local_token,
+                "models": [{
+                    "id": model_id,
+                    "name": model_id,
+                }],
             }),
         );
     }
-    let models_json = serde_json::to_string_pretty(&serde_json::json!({
-        "providers": serde_json::Value::Object(providers)
-    }))?;
-    std::fs::write(pi_agent_dir.join("models.json"), models_json)?;
 
+    let auth_path = pi_agent_dir.join("auth.json");
+    let models_path = pi_agent_dir.join("models.json");
+    std::fs::write(&auth_path, serde_json::to_string_pretty(&serde_json::Value::Object(auth))?)?;
+    std::fs::write(
+        &models_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "providers": serde_json::Value::Object(providers)
+        }))?,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&auth_path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(&models_path, std::fs::Permissions::from_mode(0o600));
+    }
     Ok(())
+}
+
+/// Tests an API key against `{base_url}/models` and returns discovered model IDs (truncated).
+pub async fn probe_provider_models(
+    base_url: &str,
+    api_key: &str,
+) -> anyhow::Result<Vec<String>> {
+    let endpoint = format!("{}/models", base_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent("lingonberry-router/0.1")
+        .build()?;
+    let resp = client.get(&endpoint).bearer_auth(api_key).send().await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "HTTP {}: {}",
+            status.as_u16(),
+            redact_secrets(&body.chars().take(200).collect::<String>())
+        );
+    }
+    let json: serde_json::Value = resp.json().await?;
+    let models = json["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| item["id"].as_str().map(str::to_string))
+                .take(25)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(models)
+}
+
+/// Determines the safest consented command to install `pi` (`pi_agent_rust`) on this host.
+pub fn recommended_pi_install_cmd() -> Option<(&'static str, Vec<&'static str>)> {
+    if which::which("cargo").is_ok() {
+        Some((
+            "cargo",
+            vec![
+                "install",
+                "--git",
+                "https://github.com/Dicklesworthstone/pi_agent_rust",
+                "--locked",
+            ],
+        ))
+    } else if which::which("brew").is_ok() {
+        Some(("brew", vec!["install", "pi-coding-agent"]))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]
@@ -489,5 +613,39 @@ mod tests {
         assert_eq!(provider_for_env("FOO_API_KEY").as_deref(), Some("foo"));
         assert_eq!(provider_for_env("NIMBUS_TOKEN"), None);
         assert_eq!(provider_for_env("PATH"), None);
+    }
+
+    #[test]
+    fn configure_pi_rust_never_writes_raw_provider_secrets() {
+        let dir = std::env::temp_dir().join(format!("lbr-pi-cfg-{}", uuid::Uuid::new_v4()));
+        let lb_dir = dir.join(".lingonberry");
+        fs::create_dir_all(&lb_dir).unwrap();
+        std::env::set_var("LINGONBERRY_HOME", &lb_dir);
+        std::env::set_var("NIM_1", "nvapi-SUPER-SECRET-SHOULD-NOT-LEAK");
+
+        let mut keys = BTreeMap::new();
+        keys.insert("nim".into(), vec!["NIM_1".into()]);
+        let disc = DiscoveryData {
+            agents: vec![],
+            keys,
+            providers: BTreeMap::new(),
+            library_dirs: vec![],
+            ssh_hosts: vec![],
+            git_projects: vec![],
+            browsers: vec![],
+            stores: vec![],
+            keychain_slots: vec![],
+        };
+        configure_pi_rust(&dir, &disc).unwrap();
+        let auth_text = fs::read_to_string(dir.join(".pi/agent/auth.json")).unwrap();
+        let models_text = fs::read_to_string(dir.join(".pi/agent/models.json")).unwrap();
+        assert!(!auth_text.contains("nvapi-SUPER-SECRET"));
+        assert!(!models_text.contains("nvapi-SUPER-SECRET"));
+        assert!(models_text.contains("127.0.0.1:8799/v1"));
+        assert!(models_text.contains("\"nim\""));
+
+        std::env::remove_var("LINGONBERRY_HOME");
+        std::env::remove_var("NIM_1");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

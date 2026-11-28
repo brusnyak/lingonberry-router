@@ -1,6 +1,6 @@
 use crate::config::lingonberry_home;
 use crate::cron::{scan_live_cron_processes, scan_os_cron_jobs};
-use crate::types::{JobRow, LiveCronProcess, Receipt, Run, RunState, SessionStep};
+use crate::types::{JobRow, LiveCronProcess, OvernightTicket, Receipt, Run, RunState, SessionStep};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use std::collections::BTreeMap;
@@ -68,11 +68,20 @@ impl SqliteStore {
                 created_at TEXT NOT NULL,
                 payload_json TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS overnight_tickets (
+                id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS kiro_specs (
+                spec_id TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
             ",
         )?;
-        // Migration: insert_run writes `key_name`, but DBs created before the rename have `key_slot` only.
-        // The insert failed silently (let _ =), so no run was ever persisted and `run` waited forever.
-        // Additive and non-destructive: old binaries keep writing key_slot; payload_json stays authoritative.
         let has_key_name = conn
             .prepare("SELECT 1 FROM pragma_table_info('runs') WHERE name = 'key_name'")?
             .exists([])?;
@@ -82,67 +91,30 @@ impl SqliteStore {
 
         let now = now_sec();
         let mut jobs = BTreeMap::new();
-        for job in [
-            JobRow {
-                name: "vault-ticket-digest".into(),
-                source: "lingonberry".into(),
-                schedule: "0 */4 * * *".into(),
-                command: "lingonberry-core run \"Digest vault tickets into backlog\"".into(),
-                every_s: Some(14400),
-                last: Some(now - 6360.0),
-                rc: Some(0),
-                paused: Some(false),
-                next_in_s: Some(8040),
-                prompt: Some("Digest new vault tickets into concise engineering backlog items".into()),
-                health: "healthy".into(),
-                running_pid: None,
-                crash_count: 0,
-                restart_count: 0,
-                auto_restart: true,
-                last_error: None,
-                log_tail: vec!["ok: digested 4 tickets cleanly (exit 0)".into()],
-            },
-            JobRow {
-                name: "doctor-health-sweep".into(),
-                source: "lingonberry".into(),
-                schedule: "*/5 * * * *".into(),
-                command: "lingonberry-core doctor".into(),
-                every_s: Some(300),
-                last: Some(now - 140.0),
-                rc: Some(0),
-                paused: Some(false),
-                next_in_s: Some(160),
-                prompt: Some("Verify config, key cooldowns, and worker reachability".into()),
-                health: "healthy".into(),
-                running_pid: None,
-                crash_count: 0,
-                restart_count: 0,
-                auto_restart: true,
-                last_error: None,
-                log_tail: vec!["ok: all routable workers reachable".into()],
-            },
-            JobRow {
-                name: "pr-gate-audit".into(),
-                source: "launchd".into(),
-                schedule: "*/30 * * * *".into(),
-                command: "lingonberry-core route \"Audit open PR diff gates\"".into(),
-                every_s: Some(1800),
-                last: Some(now - 1200.0),
-                rc: Some(0),
-                paused: Some(true),
-                next_in_s: None,
-                prompt: Some("Audit pending PR diffs and verify evidence gates".into()),
-                health: "paused".into(),
-                running_pid: None,
-                crash_count: 0,
-                restart_count: 0,
-                auto_restart: true,
-                last_error: None,
-                log_tail: vec!["paused by operator".into()],
-            },
-        ] {
-            jobs.insert(job.name.clone(), job);
-        }
+        // Only one safe, non-LLM diagnostic job is seeded by default so Lingonberry
+        // never auto-spends keys or impersonates host launchd entries.
+        let doctor_job = JobRow {
+            name: "doctor-health-sweep".into(),
+            source: "lingonberry".into(),
+            scope: "managed".into(),
+            read_only: false,
+            schedule: "*/5 * * * *".into(),
+            command: "lingonberry-core doctor".into(),
+            every_s: Some(300),
+            last: Some(now - 60.0),
+            rc: None,
+            paused: Some(false),
+            next_in_s: Some(240),
+            prompt: Some("Verify config, key cooldowns, and worker reachability".into()),
+            health: "healthy".into(),
+            running_pid: None,
+            crash_count: 0,
+            restart_count: 0,
+            auto_restart: true,
+            last_error: None,
+            log_tail: vec!["Local non-LLM readiness watchdog".into()],
+        };
+        jobs.insert(doctor_job.name.clone(), doctor_job);
 
         if scan_host {
             for os_job in scan_os_cron_jobs() {
@@ -202,10 +174,11 @@ impl SqliteStore {
 
     pub fn list_runs(&self) -> Vec<Run> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT payload_json FROM runs ORDER BY created_at DESC LIMIT 200") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let mut stmt =
+            match conn.prepare("SELECT payload_json FROM runs ORDER BY created_at DESC LIMIT 200") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
         let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
@@ -241,12 +214,26 @@ impl SqliteStore {
         }
     }
 
-    pub fn finish_run(
+    pub fn update_run_os_pid(&self, id: &str, os_pid: Option<u32>, worktree_path: Option<String>) {
+        if let Some(mut run) = self.get_run(id) {
+            if os_pid.is_some() {
+                run.os_pid = os_pid;
+            }
+            if worktree_path.is_some() {
+                run.worktree_path = worktree_path;
+            }
+            let _ = self.insert_run(&run);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_run_with_gate(
         &self,
         id: &str,
         state: RunState,
         elapsed_ms: Option<u64>,
         gate_passed: Option<bool>,
+        gate_status: Option<&str>,
         error: Option<String>,
         output: Option<String>,
         tokens_in: Option<u64>,
@@ -256,6 +243,9 @@ impl SqliteStore {
             run.state = state;
             run.elapsed_ms = elapsed_ms;
             run.gate_passed = gate_passed;
+            if let Some(gs) = gate_status {
+                run.gate_status = Some(gs.to_string());
+            }
             if let Some(e) = error {
                 run.error = Some(e);
             }
@@ -270,6 +260,28 @@ impl SqliteStore {
             }
             let _ = self.insert_run(&run);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_run(
+        &self,
+        id: &str,
+        state: RunState,
+        elapsed_ms: Option<u64>,
+        gate_passed: Option<bool>,
+        error: Option<String>,
+        output: Option<String>,
+        tokens_in: Option<u64>,
+        tokens_out: Option<u64>,
+    ) {
+        let gs = match gate_passed {
+            Some(true) => Some("passed"),
+            Some(false) => Some("failed"),
+            None => Some("not_run"),
+        };
+        self.finish_run_with_gate(
+            id, state, elapsed_ms, gate_passed, gs, error, output, tokens_in, tokens_out,
+        );
     }
 
     pub fn insert_receipt(&self, receipt: &Receipt) -> Result<()> {
@@ -295,7 +307,9 @@ impl SqliteStore {
 
     pub fn list_receipts(&self) -> Vec<Receipt> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = match conn.prepare("SELECT payload_json FROM receipts ORDER BY created_at DESC LIMIT 100") {
+        let mut stmt = match conn
+            .prepare("SELECT payload_json FROM receipts ORDER BY created_at DESC LIMIT 100")
+        {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
@@ -305,6 +319,82 @@ impl SqliteStore {
         };
         rows.flatten()
             .filter_map(|json| serde_json::from_str::<Receipt>(&json).ok())
+            .collect()
+    }
+
+    pub fn insert_ticket(&self, ticket: &OvernightTicket) -> Result<()> {
+        let json = serde_json::to_string(ticket)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO overnight_tickets (id, created_at, status, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![ticket.id, ticket.created_at, ticket.status, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_ticket(&self, id: &str) -> Option<OvernightTicket> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload_json FROM overnight_tickets WHERE id = ?1",
+            params![id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    pub fn list_tickets(&self) -> Vec<OvernightTicket> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT payload_json FROM overnight_tickets ORDER BY created_at DESC LIMIT 50")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|json| serde_json::from_str::<OvernightTicket>(&json).ok())
+            .collect()
+    }
+
+    pub fn insert_spec(&self, spec: &crate::spec_engine::KiroSpecManifest) -> Result<()> {
+        let json = serde_json::to_string(spec)?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO kiro_specs (spec_id, created_at, status, payload_json) VALUES (?1, ?2, ?3, ?4)",
+            params![spec.spec_id, spec.created_at, spec.status, json],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_spec(&self, spec_id: &str) -> Option<crate::spec_engine::KiroSpecManifest> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT payload_json FROM kiro_specs WHERE spec_id = ?1",
+            params![spec_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    }
+
+    pub fn list_specs(&self) -> Vec<crate::spec_engine::KiroSpecManifest> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = match conn
+            .prepare("SELECT payload_json FROM kiro_specs ORDER BY created_at DESC LIMIT 50")
+        {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map([], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        rows.flatten()
+            .filter_map(|json| serde_json::from_str::<crate::spec_engine::KiroSpecManifest>(&json).ok())
             .collect()
     }
 
@@ -331,6 +421,8 @@ impl SqliteStore {
                 job.health = "crashed".into();
             } else if job.restart_count > 0 {
                 job.health = "auto_healed".into();
+            } else if job.scope == "discovered" || job.read_only {
+                job.health = "discovered".into();
             } else {
                 job.health = "healthy".into();
             }
@@ -349,6 +441,9 @@ impl SqliteStore {
     pub fn toggle_job(&self, name: &str) -> Option<JobRow> {
         let mut guard = self.jobs.lock().unwrap();
         let job = guard.get_mut(name)?;
+        if job.read_only || job.scope == "discovered" {
+            return None;
+        }
         let next_paused = !job.paused.unwrap_or(false);
         job.paused = Some(next_paused);
         job.next_in_s = if next_paused {
@@ -363,6 +458,9 @@ impl SqliteStore {
     pub fn toggle_watchdog(&self, name: &str) -> Option<JobRow> {
         let mut guard = self.jobs.lock().unwrap();
         let job = guard.get_mut(name)?;
+        if job.read_only || job.scope == "discovered" {
+            return None;
+        }
         job.auto_restart = !job.auto_restart;
         job.log_tail.push(format!(
             "watchdog auto_restart={}",
@@ -377,6 +475,9 @@ impl SqliteStore {
     pub fn heal_job(&self, name: &str) -> Option<JobRow> {
         let mut guard = self.jobs.lock().unwrap();
         let job = guard.get_mut(name)?;
+        if job.read_only || job.scope == "discovered" {
+            return None;
+        }
         job.paused = Some(false);
         job.rc = Some(0);
         job.crash_count = 0;
@@ -384,7 +485,8 @@ impl SqliteStore {
         job.last_error = None;
         job.health = "auto_healed".into();
         job.next_in_s = Some(job.every_s.unwrap_or(300));
-        job.log_tail.push("watchdog healed job state & cleared crash lock".into());
+        job.log_tail
+            .push("watchdog healed job state & cleared crash lock".into());
         if job.log_tail.len() > 8 {
             job.log_tail.remove(0);
         }
@@ -404,10 +506,14 @@ impl SqliteStore {
             } else {
                 "crashed".into()
             };
-            job.last_error = log_line.clone().or_else(|| Some(format!("exited with rc={rc}")));
+            job.last_error = log_line
+                .clone()
+                .or_else(|| Some(format!("exited with rc={rc}")));
         } else {
             job.health = if job.paused.unwrap_or(false) {
                 "paused"
+            } else if job.scope == "discovered" {
+                "discovered"
             } else {
                 "healthy"
             }
@@ -420,24 +526,25 @@ impl SqliteStore {
                 job.log_tail.remove(0);
             }
         }
-        if !job.paused.unwrap_or(false) {
+        if job.scope == "managed" && !job.paused.unwrap_or(false) {
             job.next_in_s = Some(job.every_s.unwrap_or(300));
         }
         Some(job.clone())
     }
 
+    /// Evaluates ONLY Lingonberry-managed jobs. Host-discovered OS jobs are strictly read-only
+    /// and never triggered by the 5s ticker. Does NOT fake `rc = Some(0)` before completion.
     pub fn tick_jobs(&self, elapsed_s: u64) -> Vec<JobRow> {
         let mut guard = self.jobs.lock().unwrap();
         let mut due = Vec::new();
         for job in guard.values_mut() {
-            if job.paused.unwrap_or(false) {
+            if job.scope != "managed" || job.read_only || job.paused.unwrap_or(false) {
                 continue;
             }
             if let Some(rem) = job.next_in_s {
                 let updated = rem.saturating_sub(elapsed_s);
                 if updated == 0 {
                     job.last = Some(now_sec());
-                    job.rc = Some(0);
                     job.next_in_s = Some(job.every_s.unwrap_or(300));
                     due.push(job.clone());
                 } else {
@@ -449,7 +556,13 @@ impl SqliteStore {
     }
 
     pub fn remove_job(&self, name: &str) -> bool {
-        self.jobs.lock().unwrap().remove(name).is_some()
+        let mut guard = self.jobs.lock().unwrap();
+        if let Some(existing) = guard.get(name) {
+            if existing.scope == "discovered" || existing.read_only {
+                return false;
+            }
+        }
+        guard.remove(name).is_some()
     }
 }
 
@@ -472,8 +585,13 @@ mod tests {
             gate: Some("test".into()),
             state: RunState::Running,
             pid: Some(42001),
+            os_pid: None,
             elapsed_ms: None,
             gate_passed: None,
+            gate_status: Some("not_run".into()),
+            worktree_path: None,
+            cost_tier: Some("free_tier".into()),
+            budget_approved: Some(false),
             error: None,
             output: None,
             task_class: Some("debug_fix".into()),
@@ -482,6 +600,10 @@ mod tests {
             steps: vec![],
             fanout_group: None,
             failover_from: None,
+            escalation_from: None,
+            sandbox_tier: None,
+            complexity_tier: None,
+            spec_id: None,
             tokens_in: None,
             tokens_out: None,
         };
@@ -511,5 +633,34 @@ mod tests {
         let healed = store.heal_job("doctor-health-sweep").unwrap();
         assert_eq!(healed.crash_count, 0);
         assert_eq!(healed.rc, Some(0));
+    }
+
+    #[test]
+    fn ticker_never_dispatches_discovered_host_jobs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        store.upsert_job(JobRow {
+            name: "com.apple.host-job".into(),
+            source: "launchd".into(),
+            scope: "discovered".into(),
+            read_only: true,
+            schedule: "every 5s".into(),
+            command: "launchctl job com.apple.host-job".into(),
+            every_s: Some(5),
+            last: None,
+            rc: None,
+            paused: Some(false),
+            next_in_s: Some(5),
+            prompt: Some("should never dispatch".into()),
+            health: "discovered".into(),
+            running_pid: None,
+            crash_count: 0,
+            restart_count: 0,
+            auto_restart: false,
+            last_error: None,
+            log_tail: vec![],
+        });
+        let due = store.tick_jobs(10);
+        assert!(!due.iter().any(|j| j.name == "com.apple.host-job"));
+        assert!(store.toggle_job("com.apple.host-job").is_none());
     }
 }
